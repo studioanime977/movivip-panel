@@ -15,9 +15,35 @@ plain='\033[0m'
 PANEL_NAME="MOVIVIP"
 PANEL_DIR="/usr/local/movivip"
 SERVICE_NAME="movivip"
-SUB_PORT="2096"
 UPSTREAM_REPO="MHSanaei/3x-ui"
 REPO_RAW="https://raw.githubusercontent.com/studioanime977/movivip-panel/main"
+
+# ── Esquema puertos MOVIVIP PRODUCION (ssl.sh / HAProxy multipuerto) ─────────
+PANEL_PORT_INTERNAL=54322
+PANEL_PORT_HAPROXY=54323
+HAPROXY_CFG="/etc/haproxy/haproxy.cfg"
+
+RESERVED_PORTS=(
+    80 443 8080 8443
+    54322 54323
+    2001 2002 2004 8880
+    8765
+    10002 10003 10004
+    10012 10013 10014
+    10015
+)
+
+is_reserved_port() {
+    local p="$1" r
+    for r in "${RESERVED_PORTS[@]}"; do
+        [[ "$r" == "$p" ]] && return 0
+    done
+    return 1
+}
+
+haproxy_mode() {
+    [[ -f "$HAPROXY_CFG" ]]
+}
 
 log_folder="${XUI_LOG_FOLDER:=/var/log}"
 iplimit_log_path="${log_folder}/3xipl.log"
@@ -225,7 +251,13 @@ check_config() {
     server_ip=$(curl -s --max-time 3 https://api.ipify.org)
     [[ -z "$server_ip" ]] && server_ip=$(curl -s --max-time 3 https://4.ident.me)
 
-    if [[ -n "$existing_cert" ]]; then
+    echo -e "${yellow}Puerto interno:${plain} ${existing_port:-$PANEL_PORT_INTERNAL} (127.0.0.1)"
+    echo -e "${yellow}Puertos reservados (ssl.sh):${plain} ${RESERVED_PORTS[*]}"
+
+    if haproxy_mode; then
+        echo -e "${green}URL externa (HAProxy):${plain} https://${server_ip}:${PANEL_PORT_HAPROXY}/${existing_webBasePath}"
+        echo -e "${green}URL interna:${plain} http://127.0.0.1:${existing_port}/${existing_webBasePath}"
+    elif [[ -n "$existing_cert" ]]; then
         local domain
         domain=$(basename "$(dirname "$existing_cert")")
         if [[ "$domain" =~ ^[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; then
@@ -238,26 +270,94 @@ check_config() {
     fi
 }
 
+# Actualiza el backend xui_backend en haproxy.cfg para apuntar al nuevo puerto interno
+sync_haproxy_panel_backend() {
+    local port="$1"
+    haproxy_mode || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    python3 - "$HAPROXY_CFG" "$port" <<'PYEOF'
+import sys, re
+p, port = sys.argv[1], sys.argv[2]
+with open(p, 'r', encoding='utf-8', errors='replace') as f:
+    txt = f.read()
+txt = re.sub(
+    r'(backend xui_backend\n(?:    [^\n]*\n)*    server xui_local 127\.0\.0\.1:)\d+',
+    r'\g<1>' + port,
+    txt,
+)
+with open(p, 'w', encoding='utf-8') as f:
+    f.write(txt)
+PYEOF
+
+    if haproxy -c -f "$HAPROXY_CFG" >/dev/null 2>&1; then
+        systemctl reload haproxy 2>/dev/null || true
+        LOGI "HAProxy xui_backend → 127.0.0.1:${port}"
+    else
+        LOGE "haproxy.cfg inválido tras cambiar backend — revísalo."
+    fi
+}
+
+# Restringe puerto interno del panel: solo lo (mismo criterio que xui.sh PRODUCION)
+restrict_panel_port_local() {
+    local port="${1:-$PANEL_PORT_INTERNAL}"
+    command -v iptables >/dev/null 2>&1 || return 0
+
+    while iptables -C INPUT -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null || break
+    done
+    iptables -I INPUT 1 -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+
+    if ! iptables -C INPUT -p tcp --dport "$port" -j DROP 2>/dev/null; then
+        iptables -I INPUT 2 -p tcp --dport "$port" -j DROP 2>/dev/null || true
+    fi
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        while ip6tables -C INPUT -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do
+            ip6tables -D INPUT -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null || break
+        done
+        ip6tables -I INPUT 1 -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        if ! ip6tables -C INPUT -p tcp --dport "$port" -j DROP 2>/dev/null; then
+            ip6tables -I INPUT 2 -p tcp --dport "$port" -j DROP 2>/dev/null || true
+        fi
+    fi
+
+    mkdir -p /etc/iptables 2>/dev/null
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+}
+
 set_port() {
     check_install && return 1
-    read -rp "Ingresa el puerto [1-65535]: " port
+    echo -e "${yellow}Puertos RESERVADOS (no usar):${plain} ${RESERVED_PORTS[*]}"
+    read -rp "Nuevo puerto interno del panel [1-65535]: " port
     if [[ -z "$port" ]]; then
         LOGD "Cancelado"
-    else
-        $XUI_BIN setting -port "$port"
-        # abrir en firewalls
-        command -v firewall-cmd >/dev/null 2>&1 && {
-            firewall-cmd --zone=public --add-port=${port}/tcp --permanent >/dev/null 2>&1
-            firewall-cmd --reload >/dev/null 2>&1
-        }
-        command -v ufw >/dev/null 2>&1 && ufw allow "${port}/tcp" >/dev/null 2>&1
-        if command -v iptables >/dev/null 2>&1; then
-            iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 \
-                || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1
-            command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+        before_show_menu
+        return
+    fi
+    if is_reserved_port "$port"; then
+        LOGE "El puerto $port está RESERVADO por ssl.sh/HAProxy/xray. Elige otro."
+        before_show_menu
+        return
+    fi
+    if [[ ! "$port" =~ ^[0-9]+$ || "$port" -lt 1 || "$port" -gt 65535 ]]; then
+        LOGE "Puerto inválido: $port"
+        before_show_menu
+        return
+    fi
+
+    if $XUI_BIN setting -port "$port"; then
+        restrict_panel_port_local "$port"
+        sync_haproxy_panel_backend "$port"
+        LOGI "Puerto interno cambiado a ${port} (solo 127.0.0.1)."
+        if haproxy_mode; then
+            LOGI "Acceso externo: https://<IP>:${PANEL_PORT_HAPROXY}/<basePath>"
         fi
-        LOGI "Puerto cambiado a ${port} y abierto en firewall."
         confirm_restart
+    else
+        LOGE "No se pudo cambiar el puerto."
+        before_show_menu
     fi
 }
 

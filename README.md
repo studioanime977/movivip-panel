@@ -15,10 +15,26 @@ bash <(curl -sL https://raw.githubusercontent.com/studioanime977/movivip-panel/m
 ### Opciones
 
 ```bash
-bash install.sh --port 8443        # puerto fijo
-bash install.sh --no-firewall      # sin tocar firewall
-bash install.sh --version v2.4.0   # versión específica
-bash install.sh --silent           # solo log en /var/log/movivip-install.log
+bash install.sh --port 54322        # puerto interno (default)
+bash install.sh --no-firewall       # sin tocar firewall
+bash install.sh --version v2.4.0    # versión específica
+bash install.sh --silent            # solo log en /var/log/movivip-install.log
+```
+
+### Integración con ssl.sh (HAProxy multipuerto)
+
+Si detecta `/etc/haproxy/haproxy.cfg` (MOVIVIP PRODUCION):
+
+- Puerto interno del panel: **54322** (solo `127.0.0.1`, DROP externo)
+- Acceso externo: **https://IP:54323** (frontend HAProxy con cert autofirmado)
+- **NO** toca 80/443/8080/8443 ni backends xray (10002-10015, 2001/2002...)
+- `--port` rechaza puertos reservados
+
+### Puertos reservados (no usar en el panel)
+
+```
+80 443 8080 8443 | 54323 | 2001 2002 2004 8880 | 8765
+10002 10003 10004 | 10012 10013 10014 | 10015
 ```
 
 ## CLI

@@ -126,11 +126,46 @@ Heredado de 3x-ui upstream y reforzado por willzap:
 Oculta el panel detrás de una ruta no adivinable:
 `http://IP:PUERTO/<webBasePath>/`
 
-### 5.4 Puerto aleatorio 1024–62000
-`shuf -i 1024-62000 -n 1` — evita escaneos en puertos comunes (2053, 8443...).
+### 5.4 Puerto del panel: fijo 54322 (NO aleatorio)
 
-### 5.5 Firewall multi-gerenciador
-Los VPS llegan con firewalld (RHEL), ufw (Debian) o iptables puro (Oracle Cloud). willzap abre en los tres; MOVIVIP mantiene ese comportamiento + aviso de ingress rules de cloud.
+**Problema detectado con `ssl.sh` (HAProxy multipuerto):** un puerto aleatorio podía colisionar con backends reservados (10002-10015, 2001/2002, 443...).
+
+**Solución:** el panel SIEMPRE usa:
+
+| Rol | Puerto | Acceso |
+|---|---|---|
+| Panel interno (HTTP) | **54322** | solo `127.0.0.1` (iptables DROP externo) |
+| Panel externo (HTTPS) | **54323** | frontend HAProxy `xui_frontend` con cert autofirmado |
+
+`--port N` sigue permitido, pero **rechaza puertos reservados**.
+
+### 5.5 Firewall: modo HAProxy vs aislado
+
+**Con HAProxy detectado** (`/etc/haproxy/haproxy.cfg` existe):
+- **NO** abre 80/443/8080/8443 (ya los maneja `ssl.sh`)
+- Restringe 54322 a lo + DROP externo
+- Abre solo 54323 (HTTPS del panel)
+- Inserta/actualiza bloque `xui_frontend`/`xui_backend` en haproxy.cfg (réplica de `xui.sh` PRODUCION)
+
+**Sin HAProxy:**
+- Solo abre 22
+- Panel queda en 127.0.0.1:54322 con aviso
+
+### 5.6 Puertos RESERVADOS (nunca los toca el panel)
+
+Heredados de `ssl.sh` + backends internos:
+
+```
+HAProxy públicos:   80  443  8080  8443
+Panel:              54322 (interno)  54323 (HAProxy)
+XHTTP/BHTTP:        2001  2002  2004  8880
+ACME:               8765
+Xray payload:       10002 (vmess)  10003 (vless)  10004 (trojan)
+Xray gRPC:          10012  10013  10014
+SSH-WS / www:       10015
+```
+
+`install.sh` y `movivip.sh` validan contra esta lista antes de asignar cualquier puerto.
 
 ---
 
@@ -153,10 +188,13 @@ El binario `x-ui` gestiona internamente el proceso `xray-linux-*`.
 
 - [x] Credenciales default regeneradas
 - [x] webBasePath aleatorio
-- [x] Puerto aleatorio
+- [x] Puerto interno fijo 54322 (sin colisión con ssl.sh)
+- [x] Puertos reservados validados (install + CLI)
+- [x] Puerto interno restringido a 127.0.0.1
+- [x] Integración HAProxy 54323 (frontend xui_frontend)
 - [x] SHA-256 del tarball
 - [x] Log de instalación
-- [x] Firewall abierto solo en puertos necesarios
+- [x] Firewall no toca 80/443/8080/8443 en modo HAProxy
 - [ ] fail2ban (disponible vía CLI `movivip iplimit`)
 - [ ] BBR (disponible vía CLI `movivip bbr`)
 - [ ] TLS/HTTPS (ver CERTIFICADOS.md)

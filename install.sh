@@ -23,10 +23,38 @@ PANEL_DIR="/usr/local/movivip"
 CLI_BIN="/usr/bin/movivip"
 SERVICE_NAME="movivip"
 INSTALL_LOG="/var/log/movivip-install.log"
-SUB_PORT="2096"
 UPSTREAM_REPO="MHSanaei/3x-ui"
 REPO_RAW="https://raw.githubusercontent.com/studioanime977/movivip-panel/main"
 MIN_VERSION="2.3.5"
+
+# ── Esquema de puertos MOVIVIP PRODUCION (ssl.sh / HAProxy multipuerto) ──────
+# Estos puertos NO se tocan jamás. El panel solo usa 54322 (interno) / 54323 (HAProxy).
+PANEL_PORT_INTERNAL=54322   # panel 3x-ui HTTP — SOLO 127.0.0.1
+PANEL_PORT_HAPROXY=54323    # panel HTTPS externo — frontend HAProxy
+HAPROXY_CFG="/etc/haproxy/haproxy.cfg"
+
+# Puertos reservados por ssl.sh / xray / v2ray / xhttp / bhttp / ssh-ws
+RESERVED_PORTS=(
+    80 443 8080 8443          # HAProxy frontends públicos
+    54322 54323               # panel interno / panel HTTPS
+    2001 2002 2004 8880       # XHTTP/BHTTP locales
+    8765                      # ACME webroot
+    10002 10003 10004         # xray payload vmess/vless/trojan
+    10012 10013 10014         # xray gRPC
+    10015                     # ssh-ws internal / www backend
+)
+
+is_reserved_port() {
+    local p="$1" r
+    for r in "${RESERVED_PORTS[@]}"; do
+        [[ "$r" == "$p" ]] && return 0
+    done
+    return 1
+}
+
+haproxy_mode() {
+    [[ -f "$HAPROXY_CFG" ]]
+}
 
 # ------------------------------ Flags ----------------------------------------
 SILENT=0
@@ -47,15 +75,20 @@ ${green}MOVIVIP PANEL installer${plain}
 Uso: bash install.sh [opciones] [version_tag]
 
 Opciones:
-  --port <N>       Puerto del panel (default: aleatorio 1024-62000)
+  --port <N>       Puerto interno del panel (default: 54322)
+                   Rechaza puertos reservados por ssl.sh/HAProxy/xray
   --no-firewall    No configurar firewall
   --silent         No imprimir en pantalla (solo log)
   --version <v>    Instalar versión específica (ej. v2.4.0)
   -h, --help       Esta ayuda
 
+Puertos RESERVADOS (no usables por el panel):
+  80 443 8080 8443 54323 | 2001 2002 2004 8880 | 8765
+  10002-10004 10012-10015  (xray/v2ray/ssh-ws backends)
+
 Ejemplos:
   bash install.sh
-  bash install.sh --port 8443
+  bash install.sh --port 54322
   bash install.sh --version v2.4.0 --no-firewall
 EOF
     exit 0
@@ -79,6 +112,24 @@ while [[ $# -gt 0 ]]; do
             echo -e "${red}Opción desconocida: $1${plain}"; usage ;;
     esac
 done
+
+# Validar puerto personalizado contra lista de reservados
+if [[ -n "$CUSTOM_PORT" ]]; then
+    if is_reserved_port "$CUSTOM_PORT"; then
+        echo -e "${red}ERROR: el puerto ${CUSTOM_PORT} está RESERVADO por ssl.sh/HAProxy/xray.${plain}"
+        echo -e "${yellow}Puertos reservados:${plain} ${RESERVED_PORTS[*]}"
+        exit 1
+    fi
+    if [[ "$CUSTOM_PORT" -lt 1 || "$CUSTOM_PORT" -gt 65535 ]]; then
+        echo -e "${red}ERROR: puerto inválido: ${CUSTOM_PORT}${plain}"
+        exit 1
+    fi
+fi
+
+# Modo HAProxy: forzar puerto interno fijo (nunca aleatorio)
+if haproxy_mode && [[ -z "$CUSTOM_PORT" ]]; then
+    CUSTOM_PORT="$PANEL_PORT_INTERNAL"
+fi
 
 # ------------------------------ Utilidades -----------------------------------
 gen_random_string() {
@@ -297,20 +348,21 @@ config_after_install() {
     local server_ip
     server_ip=$(detect_public_ip)
 
+    # Puerto del panel: SIEMPRE el interno fijo (54322) o el custom validado.
+    # NUNCA aleatorio — evita colisionar con backends de ssl.sh/HAProxy.
+    local config_port="${CUSTOM_PORT:-$PANEL_PORT_INTERNAL}"
+
+    if is_reserved_port "$config_port"; then
+        log "${red}Puerto ${config_port} reservado — forzando ${PANEL_PORT_INTERNAL}.${plain}"
+        config_port="$PANEL_PORT_INTERNAL"
+    fi
+
     if [[ ${#existing_webBasePath} -lt 4 ]]; then
         if [[ "$hasDefaultCredential" == "true" ]]; then
-            local config_webBasePath config_username config_password config_port
+            local config_webBasePath config_username config_password
             config_webBasePath=$(gen_random_string 18)
             config_username=$(gen_random_string 10)
             config_password=$(gen_random_string 10)
-
-            if [[ -n "$CUSTOM_PORT" ]]; then
-                config_port="$CUSTOM_PORT"
-                log "Puerto personalizado: ${config_port}"
-            else
-                config_port=$(shuf -i 1024-62000 -n 1)
-                log "Puerto aleatorio generado: ${config_port}"
-            fi
 
             "$PANEL_DIR/x-ui" setting \
                 -username "$config_username" \
@@ -324,20 +376,32 @@ config_after_install() {
             echo -e "${green}###############################################${plain}"
             echo -e "  ${yellow}Usuario:${plain}    ${config_username}"
             echo -e "  ${yellow}Password:${plain}   ${config_password}"
-            echo -e "  ${yellow}Puerto:${plain}     ${config_port}"
+            echo -e "  ${yellow}Puerto interno:${plain} ${config_port} (solo 127.0.0.1)"
             echo -e "  ${yellow}BasePath:${plain}   ${config_webBasePath}"
-            echo -e "  ${yellow}URL:${plain}        http://${server_ip}:${config_port}/${config_webBasePath}"
+            if haproxy_mode; then
+                echo -e "  ${yellow}URL externa:${plain} https://${server_ip}:${PANEL_PORT_HAPROXY}/${config_webBasePath}"
+                echo -e "  ${yellow}URL interna:${plain} http://127.0.0.1:${config_port}/${config_webBasePath}"
+            else
+                echo -e "  ${yellow}URL:${plain}        http://${server_ip}:${config_port}/${config_webBasePath}"
+            fi
             echo -e "${green}###############################################${plain}"
             echo ""
             log "Credenciales generadas (también en $INSTALL_LOG)."
         else
             local config_webBasePath
             config_webBasePath=$(gen_random_string 18)
-            "$PANEL_DIR/x-ui" setting -webBasePath "$config_webBasePath"
+            "$PANEL_DIR/x-ui" setting -webBasePath "$config_webBasePath" -port "$config_port"
             log "${yellow}webBasePath faltante — regenerado: ${config_webBasePath}${plain}"
-            log "URL: http://${server_ip}:${existing_port}/${config_webBasePath}"
+            log "Puerto interno: ${config_port}"
         fi
     else
+        # Asegurar puerto fijo aunque ya exista configuración
+        if [[ -n "$existing_port" && "$existing_port" != "$config_port" ]]; then
+            if ! is_reserved_port "$config_port"; then
+                "$PANEL_DIR/x-ui" setting -port "$config_port"
+                log "Puerto del panel ajustado a ${config_port} (interno)."
+            fi
+        fi
         if [[ "$hasDefaultCredential" == "true" ]]; then
             local config_username config_password
             config_username=$(gen_random_string 10)
@@ -352,6 +416,174 @@ config_after_install() {
     fi
 
     "$PANEL_DIR/x-ui" migrate >/dev/null 2>&1
+}
+
+# ------------------------------ HAProxy: frontend panel ----------------------
+# Replica el bloque xui_frontend/xui_backend de MOVIVIP PRODUCION/protocolos/xui.sh
+# bind *:54323 ssl → server 127.0.0.1:<panel_port>
+setup_haproxy_panel_frontend() {
+    haproxy_mode || return 0
+    command -v haproxy >/dev/null 2>&1 || return 0
+
+    local panel_port
+    panel_port=$("$PANEL_DIR/x-ui" setting -show true 2>/dev/null | grep -Eo 'port: .+' | awk '{print $2}')
+    [[ -z "$panel_port" ]] && panel_port="$PANEL_PORT_INTERNAL"
+
+    local cert_dir="/etc/haproxy/certs"
+    local cert_file="$cert_dir/xui-selfsigned.pem"
+    local CFG="$HAPROXY_CFG"
+    local ip
+    ip=$(detect_public_ip)
+    [[ -z "$ip" ]] && ip=$(hostname -I | awk '{print $1}')
+
+    mkdir -p "$cert_dir"
+
+    if [[ ! -f "$cert_file" ]]; then
+        log "Generando certificado autofirmado para IP: ${ip}"
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout "$cert_dir/key.pem" -out "$cert_dir/cert.pem" \
+            -subj "/CN=$ip" -addext "subjectAltName=IP:$ip" 2>/dev/null
+        cat "$cert_dir/cert.pem" "$cert_dir/key.pem" > "$cert_file"
+        chmod 600 "$cert_file"
+    fi
+
+    # Limpiar bloque previo del panel (idempotente, igual que xui.sh)
+    python3 - "$CFG" <<'PYEOF'
+import sys, re
+p = sys.argv[1]
+with open(p, 'r', encoding='utf-8', errors='replace') as f:
+    txt = f.read()
+txt = re.sub(r'^\s*# MOVIVIP Panel config[^\n]*\ninclude /etc/haproxy/haproxy-3xui\.cfg[^\n]*\n?', '', txt, flags=re.M)
+txt = re.sub(r'^\s*include /etc/haproxy/haproxy-3xui\.cfg[^\n]*\n?', '', txt, flags=re.M)
+txt = re.sub(r'\n?frontend xui_frontend\n(?:    [^\n]*\n)+', '\n', txt)
+txt = re.sub(r'\n?backend xui_backend\n(?:    [^\n]*\n)+', '\n', txt)
+with open(p, 'w', encoding='utf-8') as f:
+    f.write(txt)
+PYEOF
+
+    cat >> "$CFG" <<EOF
+
+# MOVIVIP Panel config — HTTPS externo (por IP, cert autofirmado)
+frontend xui_frontend
+    mode http
+    bind *:${PANEL_PORT_HAPROXY} ssl crt $cert_file
+    http-request set-header X-Forwarded-Proto https
+    http-request set-header X-Forwarded-For %[src]
+    default_backend xui_backend
+
+backend xui_backend
+    mode http
+    server xui_local 127.0.0.1:${panel_port} check inter 2000 rise 2 fall 3
+EOF
+
+    rm -f /etc/haproxy/haproxy-3xui.cfg
+
+    if haproxy -c -f "$CFG" >/dev/null 2>&1; then
+        systemctl reload haproxy 2>/dev/null || true
+        log "${green}HAProxy frontend del panel configurado → https://${ip}:${PANEL_PORT_HAPROXY}${plain}"
+    else
+        log "${red}haproxy.cfg inválido tras añadir panel — revísalo manualmente.${plain}"
+        haproxy -c -f "$CFG" 2>&1 | tail -5
+    fi
+}
+
+# Restringe el puerto interno del panel: solo lo, DROP externo (como xui.sh)
+restrict_panel_port_local() {
+    local port="${1:-$PANEL_PORT_INTERNAL}"
+    command -v iptables >/dev/null 2>&1 || return 0
+
+    while iptables -C INPUT -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do
+        iptables -D INPUT -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null || break
+    done
+    iptables -I INPUT 1 -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+
+    if ! iptables -C INPUT -p tcp --dport "$port" -j DROP 2>/dev/null; then
+        iptables -I INPUT 2 -p tcp --dport "$port" -j DROP 2>/dev/null || true
+    fi
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        while ip6tables -C INPUT -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null; do
+            ip6tables -D INPUT -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null || break
+        done
+        ip6tables -I INPUT 1 -i lo -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+        if ! ip6tables -C INPUT -p tcp --dport "$port" -j DROP 2>/dev/null; then
+            ip6tables -I INPUT 2 -p tcp --dport "$port" -j DROP 2>/dev/null || true
+        fi
+    fi
+
+    mkdir -p /etc/iptables 2>/dev/null
+    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+
+    log "${green}Puerto interno ${port} restringido a 127.0.0.1 (DROP externo).${plain}"
+}
+
+# ------------------------------ Firewall -------------------------------------
+open_firewall_ports() {
+    if [[ $NO_FIREWALL -eq 1 ]]; then
+        log "${yellow}Firewall omitido (--no-firewall).${plain}"
+        return
+    fi
+
+    local panel_port
+    panel_port=$("$PANEL_DIR/x-ui" setting -show true 2>/dev/null | grep -Eo 'port: .+' | awk '{print $2}')
+    [[ -z "$panel_port" ]] && panel_port="$PANEL_PORT_INTERNAL"
+
+    if haproxy_mode; then
+        # MODO HAPROXY (ssl.sh multipuerto):
+        #  • NO abrir 80/443/8080/8443 — ya los maneja HAProxy
+        #  • Abrir solo 54323 (HTTPS panel) si hace falta
+        #  • Restringir puerto interno del panel a lo
+        log "${yellow}Modo HAProxy detectado — NO se tocan 80/443/8080/8443.${plain}"
+        log "Puerto interno panel: ${panel_port} (solo lo) | Externо: ${PANEL_PORT_HAPROXY}"
+
+        restrict_panel_port_local "$panel_port"
+
+        # Asegurar 54323 aceptado (frontend del panel)
+        if command -v iptables >/dev/null 2>&1; then
+            iptables -C INPUT -p tcp --dport "$PANEL_PORT_HAPROXY" -j ACCEPT >/dev/null 2>&1 \
+                || iptables -I INPUT -p tcp --dport "$PANEL_PORT_HAPROXY" -j ACCEPT >/dev/null 2>&1
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
+        if command -v ufw >/dev/null 2>&1; then
+            ufw allow "${PANEL_PORT_HAPROXY}/tcp" >/dev/null 2>&1
+        fi
+        if command -v firewall-cmd >/dev/null 2>&1; then
+            firewall-cmd --zone=public --add-port=${PANEL_PORT_HAPROXY}/tcp --permanent >/dev/null 2>&1
+            firewall-cmd --reload >/dev/null 2>&1
+        fi
+
+        setup_haproxy_panel_frontend
+
+        log "${green}✓ Firewall modo HAProxy: panel vía :${PANEL_PORT_HAPROXY} (HTTPS).${plain}"
+        log "${yellow}Nota cloud:${plain} abre ${PANEL_PORT_HAPROXY}/tcp en Ingress Rules si usas Oracle/AWS/GCP/Azure."
+        return
+    fi
+
+    # MODO SIN HAPROXY (instalación aislada)
+    log "${yellow}Sin HAProxy — configurando firewall para panel :${panel_port} (+22).${plain}"
+
+    restrict_panel_port_local "$panel_port"
+
+    # En modo sin haproxy el panel puede ser accesible externamente si el usuario lo desea
+    # pero por defecto mantenemos lo-only + aviso. Abrimos solo 22 y el puerto si es custom.
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall-cmd --zone=public --add-port=22/tcp --permanent >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+        log "${green}✓ firewalld: 22/tcp.${plain}"
+    fi
+    if command -v ufw >/dev/null 2>&1; then
+        ufw allow 22/tcp >/dev/null 2>&1
+        log "${green}✓ ufw: 22/tcp.${plain}"
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p tcp --dport 22 -j ACCEPT >/dev/null 2>&1 \
+            || iptables -I INPUT -p tcp --dport 22 -j ACCEPT >/dev/null 2>&1
+        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
+    fi
+
+    log "${yellow}Nota:${plain} el panel queda en 127.0.0.1:${panel_port}."
+    log "Para acceso externo instala HAProxy (ssl.sh) o libera el puerto tú mismo."
 }
 
 # ------------------------------ Servicio -------------------------------------
@@ -391,59 +623,6 @@ EOF
             && log "${green}Servicio ${SERVICE_NAME} activo.${plain}" \
             || log "${red}Servicio ${SERVICE_NAME} NO arrancó — revisa: journalctl -u ${SERVICE_NAME}${plain}"
     fi
-}
-
-# ------------------------------ Firewall -------------------------------------
-open_firewall_ports() {
-    if [[ $NO_FIREWALL -eq 1 ]]; then
-        log "${yellow}Firewall omitido (--no-firewall).${plain}"
-        return
-    fi
-
-    local panel_port
-    panel_port=$("$PANEL_DIR/x-ui" setting -show true 2>/dev/null | grep -Eo 'port: .+' | awk '{print $2}')
-    [[ -z "$panel_port" ]] && panel_port="2053"
-
-    log "${yellow}Configurando firewall (puertos 22, 80, 443, ${panel_port}, ${SUB_PORT})...${plain}"
-
-    # firewalld
-    if command -v firewall-cmd >/dev/null 2>&1; then
-        for p in 22 80 443 "$panel_port" "$SUB_PORT"; do
-            firewall-cmd --zone=public --add-port=${p}/tcp --permanent >/dev/null 2>&1
-        done
-        firewall-cmd --reload >/dev/null 2>&1
-        log "${green}✓ firewalld configurado.${plain}"
-    fi
-
-    # ufw
-    if command -v ufw >/dev/null 2>&1; then
-        ufw allow 22/tcp >/dev/null 2>&1
-        ufw allow 80/tcp >/dev/null 2>&1
-        ufw allow 443/tcp >/dev/null 2>&1
-        ufw allow "${panel_port}/tcp" >/dev/null 2>&1
-        ufw allow "${SUB_PORT}/tcp" >/dev/null 2>&1
-        log "${green}✓ ufw configurado.${plain}"
-    fi
-
-    # iptables
-    if command -v iptables >/dev/null 2>&1; then
-        for p in 22 80 443 "$panel_port" "$SUB_PORT"; do
-            iptables -C INPUT -p tcp --dport "$p" -j ACCEPT >/dev/null 2>&1 \
-                || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT >/dev/null 2>&1
-        done
-        command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent save >/dev/null 2>&1
-        log "${green}✓ iptables configurado.${plain}"
-    fi
-
-    # ip6tables
-    if command -v ip6tables >/dev/null 2>&1; then
-        for p in 22 80 443 "$panel_port" "$SUB_PORT"; do
-            ip6tables -C INPUT -p tcp --dport "$p" -j ACCEPT >/dev/null 2>&1 \
-                || ip6tables -I INPUT -p tcp --dport "$p" -j ACCEPT >/dev/null 2>&1
-        done
-    fi
-
-    log "${yellow}Nota:${plain} en Oracle Cloud / AWS / GCP / Azure recuerda abrir ${panel_port}/tcp en las Ingress Rules."
 }
 
 # ------------------------------ Main -----------------------------------------
