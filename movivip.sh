@@ -17,7 +17,7 @@ PANEL_DIR="/usr/local/movivip"
 SERVICE_NAME="movivip"
 SUB_PORT="2096"
 UPSTREAM_REPO="MHSanaei/3x-ui"
-REPO_RAW="https://raw.githubusercontent.com/wilderr19/willzap/main"
+REPO_RAW="https://raw.githubusercontent.com/studioanime977/movivip-panel/main"
 
 log_folder="${XUI_LOG_FOLDER:=/var/log}"
 iplimit_log_path="${log_folder}/3xipl.log"
@@ -538,7 +538,7 @@ uninstall() {
 
     echo ""
     LOGI "Desinstalado. Para reinstalar:"
-    echo -e "${green}bash <(curl -sL https://raw.githubusercontent.com/<TU_REPO>/main/install.sh)${plain}"
+    echo -e "${green}bash <(curl -sL https://raw.githubusercontent.com/studioanime977/movivip-panel/main/install.sh)${plain}"
     exit 0
 }
 

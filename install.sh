@@ -25,7 +25,7 @@ SERVICE_NAME="movivip"
 INSTALL_LOG="/var/log/movivip-install.log"
 SUB_PORT="2096"
 UPSTREAM_REPO="MHSanaei/3x-ui"
-REPO_RAW="https://raw.githubusercontent.com/wilderr19/willzap/main"
+REPO_RAW="https://raw.githubusercontent.com/studioanime977/movivip-panel/main"
 MIN_VERSION="2.3.5"
 
 # ------------------------------ Flags ----------------------------------------
@@ -238,7 +238,8 @@ install_panel() {
     log "Descargando CLI movivip.sh..."
     wget --inet4-only -q -O /usr/bin/movivip-temp "${REPO_RAW}/movivip.sh"
     if [[ $? -ne 0 ]]; then
-        wget --inet4-only -q -O /usr/bin/movivip-temp "${REPO_RAW}/x-ui.sh"
+        wget --inet4-only -q -O /usr/bin/movivip-temp \
+            "https://raw.githubusercontent.com/${UPSTREAM_REPO}/main/x-ui.sh"
         if [[ $? -ne 0 ]]; then
             log "${red}No se pudo descargar el CLI.${plain}"
             exit 1

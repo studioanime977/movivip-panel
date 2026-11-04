@@ -9,7 +9,7 @@ Panel de administración basado en [3x-ui](https://github.com/MHSanaei/3x-ui) co
 ## Instalación
 
 ```bash
-bash <(curl -sL https://raw.githubusercontent.com/<TU_REPO>/main/install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/studioanime977/movivip-panel/main/install.sh)
 ```
 
 ### Opciones
