@@ -167,6 +167,24 @@ SSH-WS / www:       10015
 
 `install.sh` y `movivip.sh` validan contra esta lista antes de asignar cualquier puerto.
 
+### 5.7 Inbounds del panel = backends HAProxy
+
+El panel **no** crea inbounds en 80/443. Tras instalar (o con `movivip haproxy-sync`) siembra vía API REST:
+
+```
+movivip-vmess-ws    127.0.0.1:10002  path=/vmess       → HAProxy vmess_backend
+movivip-vless-ws    127.0.0.1:10003  path=/vless       → HAProxy vless_backend
+movivip-trojan-ws   127.0.0.1:10004  path=/trojan-ws   → HAProxy trojan_backend
+movivip-vmess-grpc  127.0.0.1:10012  svc=vmess-grpc    → HAProxy grpc_vmess
+movivip-vless-grpc  127.0.0.1:10013  svc=vless-grpc    → HAProxy grpc_vless
+movivip-trojan-grpc 127.0.0.1:10014  svc=trojan-grpc   → HAProxy grpc_trojan
+```
+
+- `listen: 127.0.0.1` + `security: none` (TLS lo termina HAProxy)
+- Credenciales API en `/etc/movivip/xui-credentials` (0600)
+- Preset JSON: `presets/haproxy-inbounds.json`
+- Flujo cliente: `https://IP:443/vless` → HAProxy → `127.0.0.1:10003`
+
 ---
 
 ## 6. Modelo de servicio

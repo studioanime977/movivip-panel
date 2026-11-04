@@ -40,15 +40,39 @@ Si detecta `/etc/haproxy/haproxy.cfg` (MOVIVIP PRODUCION):
 ## CLI
 
 ```bash
-movivip              # menú de administración
-movivip start        # iniciar
-movivip stop         # detener
-movivip restart      # reiniciar
-movivip status       # estado
-movivip settings     # ajustes + URL de acceso
-movivip log          # logs
-movivip update       # actualizar panel
-movivip uninstall    # desinstalar
+movivip                  # menú de administración
+movivip start            # iniciar
+movivip stop             # detener
+movivip restart          # reiniciar
+movivip status           # estado
+movivip settings         # ajustes + URL de acceso
+movivip haproxy-sync     # crear inbounds = backends HAProxy (10002-10004, 10012-10014)
+movivip log              # logs
+movivip update           # actualizar panel
+movivip uninstall        # desinstalar
+```
+
+## Integración HAProxy (ssl.sh multipuerto)
+
+Cuando `/etc/haproxy/haproxy.cfg` existe, el instala automáticamente los **inbounds** que matchean los backends:
+
+| Ruta cliente (vía HAProxy :443) | Backend interno | Inbound 3x-ui |
+|---|---|---|
+| `/vmess` | `127.0.0.1:10002` | movivip-vmess-ws |
+| `/vless` | `127.0.0.1:10003` | movivip-vless-ws |
+| `/trojan-ws` | `127.0.0.1:10004` | movivip-trojan-ws |
+| `/vmess-grpc` | `127.0.0.1:10012` | movivip-vmess-grpc |
+| `/vless-grpc` | `127.0.0.1:10013` | movivip-vless-grpc |
+| `/trojan-grpc` | `127.0.0.1:10014` | movivip-trojan-grpc |
+
+- Todos los inbounds escuchan en **127.0.0.1** (sin TLS — HAProxy termina TLS)
+- **Nunca** usan 80/443/8080/8443 (reservados a HAProxy)
+- Presets: [`presets/haproxy-inbounds.json`](presets/haproxy-inbounds.json)
+- Resync manual: `movivip haproxy-sync`
+
+**Link de cliente ejemplo (después de añadir UUID):**
+```
+vless://<UUID>@<IP>:443?path=/vless&security=tls&type=ws#MOVIVIP
 ```
 
 ## Seguridad (generada en la instalación)

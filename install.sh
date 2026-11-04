@@ -370,6 +370,8 @@ config_after_install() {
                 -port "$config_port" \
                 -webBasePath "$config_webBasePath"
 
+            save_panel_credentials "$config_username" "$config_password"
+
             echo ""
             echo -e "${green}###############################################${plain}"
             echo -e "${green}  ${PANEL_NAME} PANEL — Credenciales de acceso${plain}"
@@ -407,6 +409,7 @@ config_after_install() {
             config_username=$(gen_random_string 10)
             config_password=$(gen_random_string 10)
             "$PANEL_DIR/x-ui" setting -username "$config_username" -password "$config_password"
+            save_panel_credentials "$config_username" "$config_password"
             echo -e "${yellow}Credenciales default detectadas — regeneradas.${plain}"
             echo -e "  Usuario:  ${green}${config_username}${plain}"
             echo -e "  Password: ${green}${config_password}${plain}"
@@ -625,6 +628,157 @@ EOF
     fi
 }
 
+# ------------------------------ Credenciales (para API) ----------------------
+save_panel_credentials() {
+    local user="$1" pass="$2"
+    local dir="/etc/movivip"
+    local cred="$dir/xui-credentials"
+    mkdir -p "$dir"
+    umask 077
+    printf 'username=%s\npassword=%s\n' "$user" "$pass" > "$cred"
+    chmod 600 "$cred"
+    log "${green}Credenciales API guardadas en ${cred}${plain}"
+}
+
+# ------------------------------ Sync inbounds HAProxy ------------------------
+# Crea/actualiza inbounds en 3x-ui apuntando a los puertos internos de ssl.sh.
+# Usa la API REST del panel (session cookie).
+PRESETS_URL="${REPO_RAW}/presets/haproxy-inbounds.json"
+
+sync_haproxy_inbounds() {
+    haproxy_mode || { log "Sin HAProxy — skip sync inbounds."; return 0; }
+    command -v python3 >/dev/null 2>&1 || { log "${yellow}python3 no disponible — sync inbounds omitido.${plain}"; return 0; }
+
+    local cred="/etc/movivip/xui-credentials"
+    [[ -f "$cred" ]] || { log "${yellow}Sin credenciales — skip sync inbounds.${plain}"; return 0; }
+
+    local panel_port
+    panel_port=$("$PANEL_DIR/x-ui" setting -show true 2>/dev/null | grep -Eo 'port: .+' | awk '{print $2}')
+    [[ -z "$panel_port" ]] && panel_port="$PANEL_PORT_INTERNAL"
+
+    local presets="/tmp/movivip-haproxy-inbounds.json"
+    log "Descargando presets de inbounds HAProxy..."
+    wget --inet4-only -q -O "$presets" "$PRESETS_URL"
+    if [[ ! -s "$presets" ]]; then
+        # fallback: embebido mínimo si falla la descarga
+        log "${yellow}No se pudo descargar presets — usando lista embebida.${plain}"
+        return 1
+    fi
+
+    log "Sincronizando inbounds con backends HAProxy (10002-10004, 10012-10014)..."
+    python3 - "$panel_port" "$cred" "$presets" <<'PYEOF'
+import json, sys, urllib.request, http.cookiejar, re
+
+panel_port, cred_path, presets_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+creds = {}
+with open(cred_path) as f:
+    for line in f:
+        if '=' in line:
+            k, v = line.strip().split('=', 1)
+            creds[k] = v
+
+username = creds.get('username', 'admin')
+password = creds.get('password', '')
+
+base = f'http://127.0.0.1:{panel_port}'
+cj = http.cookiejar.CookieJar()
+opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+def req(method, path, data=None):
+    url = base + path
+    body = None
+    headers = {}
+    if data is not None:
+        body = json.dumps(data).encode()
+        headers['Content-Type'] = 'application/json'
+    r = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with opener.open(r, timeout=15) as resp:
+        return json.loads(resp.read().decode() or '{}')
+
+# login
+try:
+    login = req('POST', '/login', {'username': username, 'password': password})
+except Exception as e:
+    print(f'LOGIN_FAIL {e}')
+    sys.exit(1)
+
+if login.get('success') is False:
+    print(f'LOGIN_FAIL {login}')
+    sys.exit(1)
+
+# listar inbounds existentes
+try:
+    lst = req('GET', '/panel/api/inbounds/list')
+except Exception as e:
+    print(f'LIST_FAIL {e}')
+    sys.exit(1)
+
+existing = {}
+for ib in (lst.get('obj') or []):
+    tag = ib.get('tag') or ''
+    port = ib.get('port')
+    existing[tag] = ib
+    # también indexar por puerto para detectar conflictos
+    existing[f'port:{port}'] = ib
+
+with open(presets_path) as f:
+    presets = json.load(f)
+
+forib = presets.get('inbounds', []):
+    tag = ib.get('tag')
+    port = ib.get('port')
+    # skip si ya existe el tag
+    if tag in existing:
+        print(f'OK exists {tag} :{port}')
+        continue
+    # si hay otro inbound en el mismo puerto, avisar
+    if f'port:{port}' in existing:
+        other = existing[f'port:{port}']
+        print(f'WARN port {port} already used by {other.get("tag")} — skip {tag}')
+        continue
+    payload = {
+        'up': 0,
+        'down': 0,
+        'remark': ib.get('tag', tag),
+        'enable': True,
+        'expiryTime': 0,
+        'listen': ib.get('listen', '127.0.0.1'),
+        'port': str(port),
+        'protocol': ib.get('protocol'),
+        'settings': ib.get('settings', {}),
+        'streamSettings': ib.get('streamSettings', {}),
+        'sniffing': ib.get('sniffing', {'enabled': True, 'destOverride': ['http', 'tls']}),
+        'tag': tag,
+    }
+    try:
+        res = req('POST', '/panel/api/inbounds/add', payload)
+        if res.get('success'):
+            print(f'OK created {tag} :{port} listen={ib.get("listen")}')
+        else:
+            print(f'FAIL create {tag}: {res}')
+    except Exception as e:
+        print(f'FAIL create {tag}: {e}')
+
+print('SYNC_DONE')
+PYEOF
+
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then
+        log "${green}Inbounds HAProxy sincronizados.${plain}"
+        # reiniciar panel para que xray recargue inbounds
+        if [[ $release == "alpine" ]]; then
+            rc-service $SERVICE_NAME restart >/dev/null 2>&1
+        else
+            systemctl restart $SERVICE_NAME >/dev/null 2>&1
+        fi
+        sleep 2
+    else
+        log "${red}Sync de inbounds falló (rc=$rc). Revisa credenciales/puerto del panel.${plain}"
+    fi
+    rm -f "$presets"
+}
+
 # ------------------------------ Main -----------------------------------------
 main() {
     install_base
@@ -632,8 +786,27 @@ main() {
     config_after_install
     install_service
     open_firewall_ports
+    sync_haproxy_inbounds
 
     log "${green}${PANEL_NAME} PANEL instalado correctamente.${plain}"
+    if haproxy_mode; then
+        cat <<EOF
+
+${cyan}Modo HAProxy activo:${plain}
+  • Panel interno:  127.0.0.1:${PANEL_PORT_INTERNAL}
+  • Panel externo:  https://<IP>:${PANEL_PORT_HAPROXY}
+  • Inbounds:       127.0.0.1:10002-10004 (ws) / 10012-10014 (grpc)
+  • Públicos:       80/443/8080/8443 → HAProxy (ssl.sh) — NO usar en inbounds
+
+  Rutas HAProxy → backend:
+    /vmess       → 127.0.0.1:10002
+    /vless       → 127.0.0.1:10003
+    /trojan-ws   → 127.0.0.1:10004
+    /vmess-grpc  → 127.0.0.1:10012
+    /vless-grpc  → 127.0.0.1:10013
+    /trojan-grpc → 127.0.0.1:10014
+EOF
+    fi
     cat <<EOF
 
 ${cyan}┌──────────────────────────────────────────────────────────┐${plain}
@@ -645,6 +818,7 @@ ${cyan}│  movivip stop${plain}         - Detener                       ${cyan}
 ${cyan}│  movivip restart${plain}      - Reiniciar                     ${cyan}│${plain}
 ${cyan}│  movivip status${plain}       - Estado actual                 ${cyan}│${plain}
 ${cyan}│  movivip settings${plain}     - Ver ajustes                   ${cyan}│${plain}
+${cyan}│  movivip haproxy-sync${plain} - Sincronizar inbounds HAProxy   ${cyan}│${plain}
 ${cyan}│  movivip log${plain}          - Ver logs                      ${cyan}│${plain}
 ${cyan}│  movivip update${plain}       - Actualizar panel              ${cyan}│${plain}
 ${cyan}│  movivip uninstall${plain}    - Desinstalar                   ${cyan}│${plain}

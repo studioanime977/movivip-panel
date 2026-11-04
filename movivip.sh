@@ -378,6 +378,12 @@ reset_user() {
         LOGI "2FA deshabilitado."
     fi
 
+    # Guardar para API haproxy-sync
+    mkdir -p /etc/movivip
+    umask 077
+    printf 'username=%s\npassword=%s\n' "$config_account" "$config_password" > /etc/movivip/xui-credentials
+    chmod 600 /etc/movivip/xui-credentials
+
     echo -e "Usuario: ${green}${config_account}${plain}"
     echo -e "Contraseña: ${green}${config_password}${plain}"
     confirm_restart
@@ -666,7 +672,8 @@ show_menu() {
     echo -e "${green}\t15.${plain} SSL / Certificados"
     echo -e "${green}\t16.${plain} Firewall"
     echo -e "${green}\t17.${plain} BBR"
-    echo -e "${green}\t18.${plain} ${red}Desinstalar${plain}"
+    echo -e "${green}\t18.${plain} Sincronizar inbounds HAProxy"
+    echo -e "${green}\t19.${plain} ${red}Desinstalar${plain}"
     echo -e "${green}\t0.${plain} ${red}Salir${plain}"
     echo -e "${cyan}└─────────────────────────────────────────────────────┘${plain}"
     read -rp "Elige una opción: " choice
@@ -697,10 +704,117 @@ show_menu() {
         15) ssl_menu ;;
         16) firewall_menu ;;
         17) bbr_menu ;;
-        18) uninstall ;;
+        18) haproxy_sync_inbounds; before_show_menu ;;
+        19) uninstall ;;
         0) exit 0 ;;
         *) LOGE "Opción inválida."; show_menu ;;
     esac
+}
+
+# ------------------------------ HAProxy sync inbounds ------------------------
+haproxy_sync_inbounds() {
+    check_install && return 1
+    haproxy_mode || { LOGE "No hay /etc/haproxy/haproxy.cfg — ssl.sh no instalado."; return 1; }
+    command -v python3 >/dev/null 2>&1 || { LOGE "Se requiere python3."; return 1; }
+
+    local cred="/etc/movivip/xui-credentials"
+    [[ -f "$cred" ]] || { LOGE "Faltan credenciales en $cred (reinstala o reset_user)."; return 1; }
+
+    local panel_port
+    panel_port=$($XUI_BIN setting -show true 2>/dev/null | grep -Eo 'port: .+' | awk '{print $2}')
+    [[ -z "$panel_port" ]] && panel_port="$PANEL_PORT_INTERNAL"
+
+    local presets="/tmp/movivip-haproxy-inbounds.json"
+    local presets_url="https://raw.githubusercontent.com/studioanime977/movivip-panel/main/presets/haproxy-inbounds.json"
+    LOGI "Descargando presets HAProxy inbounds..."
+    wget --inet4-only -q -O "$presets" "$presets_url" || true
+    [[ -s "$presets" ]] || { LOGE "No se pudo descargar presets."; return 1; }
+
+    LOGI "Sincronizando inbounds → backends 10002-10004 / 10012-10014..."
+    python3 - "$panel_port" "$cred" "$presets" <<'PYEOF'
+import json, sys, urllib.request, http.cookiejar
+
+panel_port, cred_path, presets_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+creds = {}
+with open(cred_path) as f:
+    for line in f:
+        if '=' in line:
+            k, v = line.strip().split('=', 1)
+            creds[k] = v
+
+base = f'http://127.0.0.1:{panel_port}'
+cj = http.cookiejar.CookieJar()
+opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+def req(method, path, data=None):
+    url = base + path
+    body = None
+    headers = {}
+    if data is not None:
+        body = json.dumps(data).encode()
+        headers['Content-Type'] = 'application/json'
+    r = urllib.request.Request(url, data=body, headers=headers, method=method)
+    with opener.open(r, timeout=15) as resp:
+        return json.loads(resp.read().decode() or '{}')
+
+login = req('POST', '/login', {'username': creds.get('username','admin'), 'password': creds.get('password','')})
+if login.get('success') is False:
+    print(f'LOGIN_FAIL {login}'); sys.exit(1)
+
+lst = req('GET', '/panel/api/inbounds/list')
+existing_tags = set()
+existing_ports = set()
+for ib in (lst.get('obj') or []):
+    existing_tags.add(ib.get('tag') or '')
+    existing_ports.add(str(ib.get('port')))
+
+with open(presets_path) as f:
+    presets = json.load(f)
+
+for ib in presets.get('inbounds', []):
+    tag, port = ib.get('tag'), str(ib.get('port'))
+    if tag in existing_tags:
+        print(f'OK exists {tag} :{port}'); continue
+    if port in existing_ports:
+        print(f'WARN port {port} in use — skip {tag}'); continue
+    payload = {
+        'up': 0, 'down': 0,
+        'remark': tag, 'enable': True, 'expiryTime': 0,
+        'listen': ib.get('listen', '127.0.0.1'),
+        'port': port,
+        'protocol': ib.get('protocol'),
+        'settings': ib.get('settings', {}),
+        'streamSettings': ib.get('streamSettings', {}),
+        'sniffing': ib.get('sniffing', {'enabled': True, 'destOverride': ['http', 'tls']}),
+        'tag': tag,
+    }
+    try:
+        res = req('POST', '/panel/api/inbounds/add', payload)
+        print(('OK created ' if res.get('success') else 'FAIL ') + f'{tag} :{port} {res if not res.get("success") else ""}')
+    except Exception as e:
+        print(f'FAIL {tag}: {e}')
+
+print('SYNC_DONE')
+PYEOF
+
+    local rc=$?
+    rm -f "$presets"
+    if [[ $rc -eq 0 ]]; then
+        LOGI "Inbounds sincronizados. Reiniciando panel..."
+        restart 0
+        echo ""
+        echo -e "${green}Mapa HAProxy → backend:${plain}"
+        echo "  /vmess       → 127.0.0.1:10002"
+        echo "  /vless       → 127.0.0.1:10003"
+        echo "  /trojan-ws   → 127.0.0.1:10004"
+        echo "  /vmess-grpc  → 127.0.0.1:10012"
+        echo "  /vless-grpc  → 127.0.0.1:10013"
+        echo "  /trojan-grpc → 127.0.0.1:10014"
+        echo -e "${yellow}Los clientes usan:${plain} https://<IP>:443/<path> (HAProxy termina TLS)"
+    else
+        LOGE "Sync falló (rc=$rc)."
+    fi
 }
 
 # ------------------------------ CLI subcomandos ------------------------------
@@ -723,6 +837,7 @@ case "$1" in
     geo)     update_geo ;;
     ssl)     ssl_cert_issue ;;
     firewall) firewall_menu ;;
+    haproxy-sync|haproxy_inbounds) haproxy_sync_inbounds ;;
     *)
         show_menu ;;
 esac

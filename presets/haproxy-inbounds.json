@@ -1,0 +1,148 @@
+{
+  "_comment": "Inbounds 3x-ui que replican los backends de ssl.sh/HAProxy. Listen 127.0.0.1, sin TLS (HAProxy termina TLS), paths exactos de los ACLs.",
+  "_backends": {
+    "vmess-ws": { "port": 10002, "path": "/vmess", "haproxy": "vmess_backend" },
+    "vless-ws": { "port": 10003, "path": "/vless", "haproxy": "vless_backend" },
+    "trojan-ws": { "port": 10004, "path": "/trojan-ws", "haproxy": "trojan_backend" },
+    "vmess-grpc": { "port": 10012, "serviceName": "vmess-grpc", "haproxy": "grpc_vmess_backend" },
+    "vless-grpc": { "port": 10013, "serviceName": "vless-grpc", "haproxy": "grpc_vless_backend" },
+    "trojan-grpc": { "port": 10014, "serviceName": "trojan-grpc", "haproxy": "grpc_trojan_backend" }
+  },
+  "inbounds": [
+    {
+      "tag": "movivip-vmess-ws",
+      "listen": "127.0.0.1",
+      "port": 10002,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [],
+        "decryption": "auto",
+        "fallbacks": []
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/vmess",
+          "headers": {}
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    },
+    {
+      "tag": "movivip-vless-ws",
+      "listen": "127.0.0.1",
+      "port": 10003,
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none",
+        "fallbacks": []
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/vless",
+          "headers": {}
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    },
+    {
+      "tag": "movivip-trojan-ws",
+      "listen": "127.0.0.1",
+      "port": 10004,
+      "protocol": "trojan",
+      "settings": {
+        "clients": [],
+        "fallbacks": []
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "/trojan-ws",
+          "headers": {}
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      }
+    },
+    {
+      "tag": "movivip-vmess-grpc",
+      "listen": "127.0.0.1",
+      "port": 10012,
+      "protocol": "vmess",
+      "settings": {
+        "clients": [],
+        "decryption": "auto"
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "security": "none",
+        "grpcSettings": {
+          "serviceName": "vmess-grpc",
+          "multiMode": false
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+    {
+      "tag": "movivip-vless-grpc",
+      "listen": "127.0.0.1",
+      "port": 10013,
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "security": "none",
+        "grpcSettings": {
+          "serviceName": "vless-grpc",
+          "multiMode": false
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    },
+    {
+      "tag": "movivip-trojan-grpc",
+      "listen": "127.0.0.1",
+      "port": 10014,
+      "protocol": "trojan",
+      "settings": {
+        "clients": []
+      },
+      "streamSettings": {
+        "network": "grpc",
+        "security": "none",
+        "grpcSettings": {
+          "serviceName": "trojan-grpc",
+          "multiMode": false
+        }
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls"]
+      }
+    }
+  ],
+  "forbidden_public_ports": [80, 443, 8080, 8443, 54323],
+  "note": "Los puertos públicos 80/443/8080/8443 NO se usan en inbounds: HAProxy (ssl.sh) los termina y enruta por path/SNI a estos backends 127.0.0.1."
+}
