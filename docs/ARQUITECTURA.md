@@ -26,8 +26,14 @@ El **panel web** (Go) y **xray** provienen del upstream `MHSanaei/3x-ui` release
 MOVIVIP-PANEL/
 ├── install.sh            # Instalador principal (entrypoint curl)
 ├── movivip.sh            # CLI admin → se instala como /usr/bin/movivip
+├── lib/
+│   ├── haproxy_panel_inbounds.py
+│   └── haproxy_panel_routes.py
+├── presets/
+│   └── haproxy-inbounds.json
 ├── README.md             # Instrucciones de instalación
 ├── CERTIFICADOS.md       # Guía TLS (acme.sh standalone + Cloudflare DNS)
+├── tests/
 └── docs/
     └── ARQUITECTURA.md   # Este documento
 ```
@@ -36,8 +42,10 @@ MOVIVIP-PANEL/
 
 ## 3. Flujo de instalación (`install.sh`)
 
+En MOVIVIP PRODUCCIÓN, `protocolos/movivip-panel.sh` conserva el control de licencia y descarga este instalador desde el repositorio MOVIVIP-PANEL. La opción de Protocolos llama directamente a ese lanzador; el antiguo `protocolos/xui.sh` ya no forma parte del flujo. El servicio, el firewall, el certificado y HAProxy se configuran aquí.
+
 ```
-bash <(curl -sL .../install.sh)
+bash <(curl -sL https://raw.githubusercontent.com/studioanime977/movivip-panel/main/install.sh)
             │
             ▼
    ┌─────────────────┐   no
@@ -51,7 +59,7 @@ bash <(curl -sL .../install.sh)
    └────────┬────────┘
             ▼
    ┌─────────────────┐
-   │ install_base()   │  wget curl tar tzdata vía apt/yum/dnf/pacman/zypper/apk
+   │ install_base()   │  wget curl tar tzdata python3 openssl vía gestor del SO
    └────────┬────────┘
             ▼
    ┌─────────────────────────────────────────┐
@@ -72,7 +80,7 @@ bash <(curl -sL .../install.sh)
    │      username  = random 10              │
    │      password  = random 10              │
    │      webBasePath = random 18            │
-   │      port = user|shuf 1024-62000        │
+   │      puerto interno = 54322            │
    │  • x-ui setting ... / x-ui migrate      │
    └────────┬────────────────────────────────┘
             ▼
@@ -83,10 +91,17 @@ bash <(curl -sL .../install.sh)
             ▼
    ┌─────────────────────────────────────────┐
    │ open_firewall_ports()                   │
-   │  22, 80, 443, <panel_port>, 2096        │
-   │  firewalld → ufw → iptables → ip6tables │
+   │  HAProxy: 54323 público, 54322 local   │
+   │  sin HAProxy: panel solo en localhost  │
    └────────┬────────────────────────────────┘
             ▼
+   ┌─────────────────────────────────────────┐
+   │ Configuración HAProxy (si existe)       │
+   │  • frontend HTTPS :54323 + certificado  │
+   │  • rutas /mx-* y backends en 11002+     │
+   │  • valida, respalda y revierte fallos   │
+   └────────┬────────────────────────────────┘
+   ▼
    Imprime URL de acceso + credenciales
 ```
 
@@ -100,7 +115,7 @@ bash <(curl -sL .../install.sh)
 | Servicio systemd | `x-ui.service` | `movivip.service` |
 | CLI | `/usr/bin/x-ui` | `/usr/bin/movivip` |
 | Sub puerto | 2096 | 2096 |
-| Checksum tarball | ❌ sin verificar | ✅ SHA-256 |
+| Checksum tarball | ❌ sin verificar | ✅ SHA-256 (publicado si el release lo incluye) |
 | Flags CLI install | ❌ | `--port N --no-firewall --silent` |
 | Log instalación | ❌ | `/var/log/movivip-install.log` |
 | Desinstalador | `x-ui uninstall` | `movivip uninstall` |
@@ -130,12 +145,12 @@ Oculta el panel detrás de una ruta no adivinable:
 
 **Problema detectado con `ssl.sh` (HAProxy multipuerto):** un puerto aleatorio podía colisionar con backends reservados (10002-10015, 2001/2002, 443...).
 
-**Solución:** el panel SIEMPRE usa:
+**Solución:** en MOVIVIP PRODUCCIÓN el panel usa:
 
 | Rol | Puerto | Acceso |
 |---|---|---|
-| Panel interno (HTTP) | **54322** | solo `127.0.0.1` (iptables DROP externo) |
-| Panel externo (HTTPS) | **54323** | frontend HAProxy `xui_frontend` con cert autofirmado |
+| Panel interno (HTTP) | **54322** | solo `127.0.0.1` (filtrado por firewall) |
+| Panel externo (HTTPS) | **54323** | frontend HAProxy `xui_frontend` con certificado autofirmado |
 
 `--port N` sigue permitido, pero **rechaza puertos reservados**.
 
@@ -145,7 +160,9 @@ Oculta el panel detrás de una ruta no adivinable:
 - **NO** abre 80/443/8080/8443 (ya los maneja `ssl.sh`)
 - Restringe 54322 a lo + DROP externo
 - Abre solo 54323 (HTTPS del panel)
-- Inserta/actualiza bloque `xui_frontend`/`xui_backend` en haproxy.cfg (réplica de `xui.sh` PRODUCION)
+- Configura y valida el frontend `xui_frontend`/`xui_backend` en `haproxy.cfg`.
+- Prepara rutas WebSocket `/mx-*` en `ssl_frontend` y gRPC en `h2_frontend`.
+- Revierte la configuración HAProxy si falla la validación o recarga.
 
 **Sin HAProxy:**
 - Solo abre 22
@@ -160,30 +177,30 @@ HAProxy públicos:   80  443  8080  8443
 Panel:              54322 (interno)  54323 (HAProxy)
 XHTTP/BHTTP:        2001  2002  2004  8880
 ACME:               8765
-Xray payload:       10002 (vmess)  10003 (vless)  10004 (trojan)
-Xray gRPC:          10012  10013  10014
-SSH-WS / www:       10015
+Xray manager:       10002-10004 (WS)  10012-10014 (gRPC)  10015 (SSH-WS)
+V2Ray manager:      10022-10024 (WS)  10032-10034 (gRPC)
+MOVIVIP-PANEL:      11002-11004 (WS)  11012-11014 (gRPC)
 ```
 
 `install.sh` y `movivip.sh` validan contra esta lista antes de asignar cualquier puerto.
 
 ### 5.7 Inbounds del panel = backends HAProxy
 
-El panel **no** crea inbounds en 80/443. Tras instalar (o con `movivip haproxy-sync`) siembra vía API REST:
+El instalador y `movivip haproxy-sync` crean/verifican los seis inbounds por REST; un fallo de creación o etiquetado aborta la instalación/sincronización. Cada inbound se comparte en los puertos públicos admitidos por su transporte:
 
-```
-movivip-vmess-ws    127.0.0.1:10002  path=/vmess       → HAProxy vmess_backend
-movivip-vless-ws    127.0.0.1:10003  path=/vless       → HAProxy vless_backend
-movivip-trojan-ws   127.0.0.1:10004  path=/trojan-ws   → HAProxy trojan_backend
-movivip-vmess-grpc  127.0.0.1:10012  svc=vmess-grpc    → HAProxy grpc_vmess
-movivip-vless-grpc  127.0.0.1:10013  svc=vless-grpc    → HAProxy grpc_vless
-movivip-trojan-grpc 127.0.0.1:10014  svc=trojan-grpc   → HAProxy grpc_trojan
-```
+| Transporte | Puerto público | Inbounds internos |
+|---|---:|---|
+| WS HTTP | 80, 8080 | VMess `11002`; VLESS `11003`; Trojan `11004` |
+| WS TLS | 443, 8443 | VMess `11002`; VLESS `11003`; Trojan `11004` |
+| gRPC TLS/H2 | 443, 8443 | VMess `11012`; VLESS `11013`; Trojan `11014` |
 
-- `listen: 127.0.0.1` + `security: none` (TLS lo termina HAProxy)
+Cada fila tiene una ruta WS o un `serviceName` gRPC único y un backend HAProxy al puerto loopback asignado. TLS termina en HAProxy; Xray escucha en `127.0.0.1` sin TLS. La cuenta creada desde la fila del inbound se usa en todos los puertos públicos indicados para ese transporte.
+
+La sincronización conserva los clientes y la configuración de los seis inbounds mientras actualiza solo la etiqueta visible.
+
 - Credenciales API en `/etc/movivip/xui-credentials` (0600)
 - Preset JSON: `presets/haproxy-inbounds.json`
-- Flujo cliente: `https://IP:443/vless` → HAProxy → `127.0.0.1:10003`
+- **No** abrir los puertos internos `11002–11014` al público.
 
 ---
 
@@ -209,8 +226,8 @@ El binario `x-ui` gestiona internamente el proceso `xray-linux-*`.
 - [x] Puerto interno fijo 54322 (sin colisión con ssl.sh)
 - [x] Puertos reservados validados (install + CLI)
 - [x] Puerto interno restringido a 127.0.0.1
-- [x] Integración HAProxy 54323 (frontend xui_frontend)
-- [x] SHA-256 del tarball
+- [x] Integración HAProxy 54323 y rutas `/mx-*` (frontends y backends)
+- [x] SHA-256 del tarball (verifica el checksum publicado cuando está disponible)
 - [x] Log de instalación
 - [x] Firewall no toca 80/443/8080/8443 en modo HAProxy
 - [ ] fail2ban (disponible vía CLI `movivip iplimit`)

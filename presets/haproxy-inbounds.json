@@ -1,18 +1,34 @@
 {
-  "_comment": "Inbounds 3x-ui que replican los backends de ssl.sh/HAProxy. Listen 127.0.0.1, sin TLS (HAProxy termina TLS), paths exactos de los ACLs.",
-  "_backends": {
-    "vmess-ws": { "port": 10002, "path": "/vmess", "haproxy": "vmess_backend" },
-    "vless-ws": { "port": 10003, "path": "/vless", "haproxy": "vless_backend" },
-    "trojan-ws": { "port": 10004, "path": "/trojan-ws", "haproxy": "trojan_backend" },
-    "vmess-grpc": { "port": 10012, "serviceName": "vmess-grpc", "haproxy": "grpc_vmess_backend" },
-    "vless-grpc": { "port": 10013, "serviceName": "vless-grpc", "haproxy": "grpc_vless_backend" },
-    "trojan-grpc": { "port": 10014, "serviceName": "trojan-grpc", "haproxy": "grpc_trojan_backend" }
+  "_comment": "Seis inbounds 3x-ui propios del panel. HAProxy comparte las rutas WS por 80/8080 HTTP y 443/8443 TLS; gRPC usa 443/8443 TLS/H2.",
+  "_reserved_by_others": {
+    "xray_manager": { "ports": [10002, 10003, 10004, 10012, 10013, 10014], "paths": ["/vmess", "/vless", "/trojan-ws", "/vmess-grpc", "/vless-grpc", "/trojan-grpc"] },
+    "v2ray": { "ports": [10022, 10023, 10024, 10032, 10033, 10034], "paths": ["/vmess-v2ray", "/vless-v2ray", "/trojan-v2ray"] },
+    "ssh_ws": { "ports": [10015], "paths": ["/fightertunnelssh"] },
+    "haproxy_public": [80, 443, 8080, 8443]
+  },
+  "_panel_own": {
+    "prefix_paths": "/mx-",
+    "ports_base": 11000,
+    "public_entrypoints": {
+      "ws_http": [80, 8080],
+      "ws_tls": [443, 8443],
+      "grpc_tls": [443, 8443]
+    },
+    "map": {
+      "mx-vmess-ws": { "port": 11002, "path": "/mx-vmess" },
+      "mx-vless-ws": { "port": 11003, "path": "/mx-vless" },
+      "mx-trojan-ws": { "port": 11004, "path": "/mx-trojan-ws" },
+      "mx-vmess-grpc": { "port": 11012, "serviceName": "mx-vmess-grpc" },
+      "mx-vless-grpc": { "port": 11013, "serviceName": "mx-vless-grpc" },
+      "mx-trojan-grpc": { "port": 11014, "serviceName": "mx-trojan-grpc" }
+    }
   },
   "inbounds": [
     {
-      "tag": "movivip-vmess-ws",
+      "tag": "mx-vmess-ws",
+      "remark": "VMess WS · HTTP 80/8080 · TLS 443/8443",
       "listen": "127.0.0.1",
-      "port": 10002,
+      "port": 11002,
       "protocol": "vmess",
       "settings": {
         "clients": [],
@@ -23,7 +39,7 @@
         "network": "ws",
         "security": "none",
         "wsSettings": {
-          "path": "/vmess",
+          "path": "/mx-vmess",
           "headers": {}
         }
       },
@@ -33,9 +49,10 @@
       }
     },
     {
-      "tag": "movivip-vless-ws",
+      "tag": "mx-vless-ws",
+      "remark": "VLESS WS · HTTP 80/8080 · TLS 443/8443",
       "listen": "127.0.0.1",
-      "port": 10003,
+      "port": 11003,
       "protocol": "vless",
       "settings": {
         "clients": [],
@@ -46,7 +63,7 @@
         "network": "ws",
         "security": "none",
         "wsSettings": {
-          "path": "/vless",
+          "path": "/mx-vless",
           "headers": {}
         }
       },
@@ -56,9 +73,10 @@
       }
     },
     {
-      "tag": "movivip-trojan-ws",
+      "tag": "mx-trojan-ws",
+      "remark": "Trojan WS · HTTP 80/8080 · TLS 443/8443",
       "listen": "127.0.0.1",
-      "port": 10004,
+      "port": 11004,
       "protocol": "trojan",
       "settings": {
         "clients": [],
@@ -68,7 +86,7 @@
         "network": "ws",
         "security": "none",
         "wsSettings": {
-          "path": "/trojan-ws",
+          "path": "/mx-trojan-ws",
           "headers": {}
         }
       },
@@ -78,9 +96,10 @@
       }
     },
     {
-      "tag": "movivip-vmess-grpc",
+      "tag": "mx-vmess-grpc",
+      "remark": "VMess gRPC · TLS/H2 443/8443",
       "listen": "127.0.0.1",
-      "port": 10012,
+      "port": 11012,
       "protocol": "vmess",
       "settings": {
         "clients": [],
@@ -90,7 +109,7 @@
         "network": "grpc",
         "security": "none",
         "grpcSettings": {
-          "serviceName": "vmess-grpc",
+          "serviceName": "mx-vmess-grpc",
           "multiMode": false
         }
       },
@@ -100,9 +119,10 @@
       }
     },
     {
-      "tag": "movivip-vless-grpc",
+      "tag": "mx-vless-grpc",
+      "remark": "VLESS gRPC · TLS/H2 443/8443",
       "listen": "127.0.0.1",
-      "port": 10013,
+      "port": 11013,
       "protocol": "vless",
       "settings": {
         "clients": [],
@@ -112,7 +132,7 @@
         "network": "grpc",
         "security": "none",
         "grpcSettings": {
-          "serviceName": "vless-grpc",
+          "serviceName": "mx-vless-grpc",
           "multiMode": false
         }
       },
@@ -122,9 +142,10 @@
       }
     },
     {
-      "tag": "movivip-trojan-grpc",
+      "tag": "mx-trojan-grpc",
+      "remark": "Trojan gRPC · TLS/H2 443/8443",
       "listen": "127.0.0.1",
-      "port": 10014,
+      "port": 11014,
       "protocol": "trojan",
       "settings": {
         "clients": []
@@ -133,7 +154,7 @@
         "network": "grpc",
         "security": "none",
         "grpcSettings": {
-          "serviceName": "trojan-grpc",
+          "serviceName": "mx-trojan-grpc",
           "multiMode": false
         }
       },
@@ -144,5 +165,11 @@
     }
   ],
   "forbidden_public_ports": [80, 443, 8080, 8443, 54323],
-  "note": "Los puertos públicos 80/443/8080/8443 NO se usan en inbounds: HAProxy (ssl.sh) los termina y enruta por path/SNI a estos backends 127.0.0.1."
+  "public_entrypoints": {
+    "ws_http": [80, 8080],
+    "ws_tls": [443, 8443],
+    "grpc_tls": [443, 8443],
+    "note": "The installer creates loopback-only inbounds; HAProxy exposes WS on all four ports and gRPC over TLS/HTTP2 on 443 and 8443."
+  },
+  "client_example": "vless://<UUID>@<IP>:443?path=/mx-vless&security=tls&type=ws#MOVIVIP-PANEL"
 }

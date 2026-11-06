@@ -298,7 +298,7 @@ PYEOF
     fi
 }
 
-# Restringe puerto interno del panel: solo lo (mismo criterio que xui.sh PRODUCION)
+# Restringe puerto interno del panel: solo lo.
 restrict_panel_port_local() {
     local port="${1:-$PANEL_PORT_INTERNAL}"
     command -v iptables >/dev/null 2>&1 || return 0
@@ -613,12 +613,30 @@ update() {
 }
 
 update_shell() {
-    wget -q -O /usr/bin/movivip -N "${REPO_RAW}/movivip.sh"
-    if [[ $? -ne 0 ]]; then
+    local helper_dir="$PANEL_DIR/lib"
+    local helper_tmp="$helper_dir/haproxy_panel_routes.py.tmp"
+    local inbounds_helper_tmp="$helper_dir/haproxy_panel_inbounds.py.tmp"
+    mkdir -p "$helper_dir" || { LOGE "No se pudo preparar $helper_dir."; before_show_menu; return; }
+    if ! wget -q -O "$helper_tmp" "${REPO_RAW}/lib/haproxy_panel_routes.py" \
+       || [[ ! -s "$helper_tmp" ]]; then
+        rm -f "$helper_tmp"
+        LOGE "Fallo descarga del helper HAProxy."
+    elif ! wget -q -O "$inbounds_helper_tmp" "${REPO_RAW}/lib/haproxy_panel_inbounds.py" \
+       || [[ ! -s "$inbounds_helper_tmp" ]]; then
+        rm -f "$helper_tmp" "$inbounds_helper_tmp"
+        LOGE "Fallo descarga del helper de sincronización de inbounds."
+    elif ! mv -f "$helper_tmp" "$helper_dir/haproxy_panel_routes.py"; then
+        rm -f "$helper_tmp" "$inbounds_helper_tmp"
+        LOGE "No se pudo instalar el helper HAProxy."
+    elif ! mv -f "$inbounds_helper_tmp" "$helper_dir/haproxy_panel_inbounds.py"; then
+        rm -f "$inbounds_helper_tmp"
+        LOGE "No se pudo instalar el helper de sincronización de inbounds."
+    elif ! wget -q -O /usr/bin/movivip "${REPO_RAW}/movivip.sh"; then
         LOGE "Fallo descarga del CLI. ¿Conectividad a GitHub?"
     else
+        chmod 644 "$helper_dir/haproxy_panel_routes.py" "$helper_dir/haproxy_panel_inbounds.py"
         chmod +x /usr/bin/movivip
-        LOGI "CLI actualizado. Relanza movivip."
+        LOGI "CLI y helpers HAProxy/inbounds actualizados. Relanza movivip."
     fi
     before_show_menu
 }
@@ -712,109 +730,152 @@ show_menu() {
 }
 
 # ------------------------------ HAProxy sync inbounds ------------------------
+# Puertos y paths PROPIOS del panel — NO chocan con Xray manager (10002-10004)
+# ni V2Ray (10022-10024). Ver presets/haproxy-inbounds.json
+PANEL_BACKEND_PORTS=(11002 11003 11004 11012 11013 11014)
+XRAY_MANAGER_PORTS=(10002 10003 10004 10012 10013 10014 10015)
+V2RAY_PORTS=(10022 10023 10024 10032 10033 10034)
+
+inject_haproxy_panel_routes() {
+    command -v python3 >/dev/null 2>&1 || { LOGE "python3 requerido para inyectar rutas HAProxy."; return 1; }
+    local cfg="${HAPROXY_CFG:-/etc/haproxy/haproxy.cfg}"
+    local helper="$PANEL_DIR/lib/haproxy_panel_routes.py"
+    local backup result
+    [[ -f "$cfg" ]] || { LOGE "No existe $cfg"; return 1; }
+    [[ -s "$helper" ]] || { LOGE "No existe el helper de rutas: $helper"; return 1; }
+
+    backup=$(mktemp "${cfg}.panel-backup.XXXXXX") || { LOGE "No se pudo crear respaldo de HAProxy."; return 1; }
+    if ! cp -p "$cfg" "$backup"; then
+        rm -f "$backup"
+        LOGE "No se pudo respaldar $cfg."
+        return 1
+    fi
+    if ! result=$(python3 "$helper" "$cfg"); then
+        if ! cp -p "$backup" "$cfg"; then
+            LOGE "Falló la inyección; respaldo disponible en $backup."
+            return 1
+        fi
+        rm -f "$backup"
+        LOGE "No se pudieron inyectar las rutas del panel."
+        return 1
+    fi
+    if ! haproxy -c -f "$cfg" >/dev/null 2>&1; then
+        if ! cp -p "$backup" "$cfg"; then
+            LOGE "haproxy -c falló; respaldo disponible en $backup."
+            return 1
+        fi
+        rm -f "$backup"
+        LOGE "haproxy -c falló; se restauró la configuración anterior."
+        haproxy -c -f "$cfg" 2>&1 | tail -5
+        return 1
+    fi
+
+    if [[ "$result" == *MOVIVIP_PANEL_ROUTES_UPDATED* ]]; then
+        if ! systemctl reload haproxy 2>/dev/null && ! systemctl restart haproxy 2>/dev/null; then
+            if ! cp -p "$backup" "$cfg"; then
+                LOGE "Falló la recarga; respaldo disponible en $backup."
+                return 1
+            fi
+            rm -f "$backup"
+            LOGE "No se pudo recargar ni reiniciar HAProxy."
+            return 1
+        fi
+        LOGI "Rutas del panel instaladas y HAProxy recargado."
+    else
+        LOGI "Rutas del panel ya listas; no se modificó ni recargó HAProxy."
+    fi
+    rm -f "$backup"
+}
+
+check_panel_port_conflicts() {
+    local conflict=0 p owner
+    for p in "${PANEL_BACKEND_PORTS[@]}"; do
+        if ss -lnt 2>/dev/null | grep -q ":${p} "; then
+            owner=$(ss -lntp 2>/dev/null | grep ":${p} " | head -1 | grep -oP 'users:\(\("\K[^"]+' || echo "?")
+            # Si lo escucha el xray del panel (3x-ui), no es conflicto
+            if [[ "$owner" != *"x-ui"* && "$owner" != *"xray"* ]] || [[ -n "$owner" && "$owner" != "x-ui" && "$owner" != "xray" ]]; then
+                # Verificar si es xray del panel (mismo binario)
+                if pgrep -f "x-ui.*bin/xray" >/dev/null 2>&1 || pgrep -af xray 2>/dev/null | grep -q "config.json"; then
+                    # Puede ser xray del panel — warning suave
+                    LOGW "Puerto $p en uso ($owner) — si es xray del panel OK, si es manager/v2ray CHOCA."
+                else
+                    LOGE "CONFLICTO puerto $p ocupado por: $owner"
+                    conflict=1
+                fi
+            fi
+        fi
+    done
+    # Avisar si xray manager activo en puertos viejos
+    for p in "${XRAY_MANAGER_PORTS[@]}"; do
+        if ss -lnt 2>/dev/null | grep -q ":${p} "; then
+            LOGI "Info: xray manager usa $p (OK — panel usa 11000+)"
+        fi
+    done
+    return $conflict
+}
+
 haproxy_sync_inbounds() {
     check_install && return 1
     haproxy_mode || { LOGE "No hay /etc/haproxy/haproxy.cfg — ssl.sh no instalado."; return 1; }
     command -v python3 >/dev/null 2>&1 || { LOGE "Se requiere python3."; return 1; }
 
+    check_panel_port_conflicts || {
+        LOGW "Hay posibles conflictos de puertos. Revisa arriba antes de continuar."
+        confirm "¿Continuar igualmente?" "n" || return 1
+    }
+
     local cred="/etc/movivip/xui-credentials"
     [[ -f "$cred" ]] || { LOGE "Faltan credenciales en $cred (reinstala o reset_user)."; return 1; }
 
-    local panel_port
-    panel_port=$($XUI_BIN setting -show true 2>/dev/null | grep -Eo 'port: .+' | awk '{print $2}')
+    local panel_settings panel_port panel_base_path
+    panel_settings=$($XUI_BIN setting -show true 2>/dev/null)
+    panel_port=$(echo "$panel_settings" | grep -Eo 'port: .+' | awk '{print $2}')
     [[ -z "$panel_port" ]] && panel_port="$PANEL_PORT_INTERNAL"
+    panel_base_path=$(echo "$panel_settings" | grep -Eo 'webBasePath: .+' | awk '{print $2}')
 
     local presets="/tmp/movivip-haproxy-inbounds.json"
     local presets_url="https://raw.githubusercontent.com/studioanime977/movivip-panel/main/presets/haproxy-inbounds.json"
-    LOGI "Descargando presets HAProxy inbounds..."
-    wget --inet4-only -q -O "$presets" "$presets_url" || true
+    LOGI "Cargando preset de los seis inbounds (paths /mx-*, puertos 11002+)..."
+    if [[ -s "$PANEL_DIR/presets/haproxy-inbounds.json" ]]; then
+        cp "$PANEL_DIR/presets/haproxy-inbounds.json" "$presets"
+    else
+        wget --inet4-only -q -O "$presets" "$presets_url" || true
+    fi
     [[ -s "$presets" ]] || { LOGE "No se pudo descargar presets."; return 1; }
 
-    LOGI "Sincronizando inbounds → backends 10002-10004 / 10012-10014..."
-    python3 - "$panel_port" "$cred" "$presets" <<'PYEOF'
-import json, sys, urllib.request, http.cookiejar
-
-panel_port, cred_path, presets_path = sys.argv[1], sys.argv[2], sys.argv[3]
-
-creds = {}
-with open(cred_path) as f:
-    for line in f:
-        if '=' in line:
-            k, v = line.strip().split('=', 1)
-            creds[k] = v
-
-base = f'http://127.0.0.1:{panel_port}'
-cj = http.cookiejar.CookieJar()
-opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
-
-def req(method, path, data=None):
-    url = base + path
-    body = None
-    headers = {}
-    if data is not None:
-        body = json.dumps(data).encode()
-        headers['Content-Type'] = 'application/json'
-    r = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with opener.open(r, timeout=15) as resp:
-        return json.loads(resp.read().decode() or '{}')
-
-login = req('POST', '/login', {'username': creds.get('username','admin'), 'password': creds.get('password','')})
-if login.get('success') is False:
-    print(f'LOGIN_FAIL {login}'); sys.exit(1)
-
-lst = req('GET', '/panel/api/inbounds/list')
-existing_tags = set()
-existing_ports = set()
-for ib in (lst.get('obj') or []):
-    existing_tags.add(ib.get('tag') or '')
-    existing_ports.add(str(ib.get('port')))
-
-with open(presets_path) as f:
-    presets = json.load(f)
-
-for ib in presets.get('inbounds', []):
-    tag, port = ib.get('tag'), str(ib.get('port'))
-    if tag in existing_tags:
-        print(f'OK exists {tag} :{port}'); continue
-    if port in existing_ports:
-        print(f'WARN port {port} in use — skip {tag}'); continue
-    payload = {
-        'up': 0, 'down': 0,
-        'remark': tag, 'enable': True, 'expiryTime': 0,
-        'listen': ib.get('listen', '127.0.0.1'),
-        'port': port,
-        'protocol': ib.get('protocol'),
-        'settings': ib.get('settings', {}),
-        'streamSettings': ib.get('streamSettings', {}),
-        'sniffing': ib.get('sniffing', {'enabled': True, 'destOverride': ['http', 'tls']}),
-        'tag': tag,
-    }
-    try:
-        res = req('POST', '/panel/api/inbounds/add', payload)
-        print(('OK created ' if res.get('success') else 'FAIL ') + f'{tag} :{port} {res if not res.get("success") else ""}')
-    except Exception as e:
-        print(f'FAIL {tag}: {e}')
-
-print('SYNC_DONE')
-PYEOF
+    LOGI "Sincronizando y rotulando inbounds del panel → 11002-11004 / 11012-11014..."
+    local inbounds_helper="$PANEL_DIR/lib/haproxy_panel_inbounds.py"
+    [[ -s "$inbounds_helper" ]] || { LOGE "No existe el helper de inbounds: $inbounds_helper."; return 1; }
+    local forbidden_csv="10002,10003,10004,10012,10013,10014,10015,10022,10023,10024,10032,10033,10034,80,443,8080,8443,54322,54323"
+    python3 "$inbounds_helper" "$panel_port" "$cred" "$presets" "$forbidden_csv" "$panel_base_path"
 
     local rc=$?
     rm -f "$presets"
-    if [[ $rc -eq 0 ]]; then
-        LOGI "Inbounds sincronizados. Reiniciando panel..."
-        restart 0
-        echo ""
-        echo -e "${green}Mapa HAProxy → backend:${plain}"
-        echo "  /vmess       → 127.0.0.1:10002"
-        echo "  /vless       → 127.0.0.1:10003"
-        echo "  /trojan-ws   → 127.0.0.1:10004"
-        echo "  /vmess-grpc  → 127.0.0.1:10012"
-        echo "  /vless-grpc  → 127.0.0.1:10013"
-        echo "  /trojan-grpc → 127.0.0.1:10014"
-        echo -e "${yellow}Los clientes usan:${plain} https://<IP>:443/<path> (HAProxy termina TLS)"
-    else
-        LOGE "Sync falló (rc=$rc)."
+    if [[ $rc -ne 0 ]]; then
+        LOGE "Sync de inbounds falló (rc=$rc)."
+        return 1
     fi
+
+    LOGI "Seis inbounds sincronizados. Inyectando rutas HAProxy..."
+    inject_haproxy_panel_routes || { rm -f "$presets"; return 1; }
+    rm -f "$presets"
+
+    LOGI "Reiniciando panel..."
+    restart 0
+    echo ""
+    echo -e "${green}Mapa PANEL (3x-ui) — separado de xray manager:${plain}"
+    echo "  /mx-vmess       → 127.0.0.1:11002  (NO /vmess de xray :10002)"
+    echo "  /mx-vless       → 127.0.0.1:11003  (NO /vless de xray :10003)"
+    echo "  /mx-trojan-ws   → 127.0.0.1:11004  (NO /trojan-ws :10004)"
+    echo "  /mx-vmess-grpc  → 127.0.0.1:11012"
+    echo "  /mx-vless-grpc  → 127.0.0.1:11013"
+    echo "  /mx-trojan-grpc → 127.0.0.1:11014"
+    echo "  WebSocket HTTP  → :80 / :8080; TLS → :443 / :8443"
+    echo "  gRPC TLS/H2     → :443 / :8443"
+    echo ""
+    echo -e "${yellow}Xray manager sigue en:${plain} 10002-10004, 10012-10014 (/vmess, /vless...)"
+    echo -e "${yellow}V2Ray sigue en:${plain} 10022-10024 (/vmess-v2ray...)"
+    echo -e "${green}Link cliente panel:${plain} https://<IP>:443/mx-vless?..."
 }
 
 # ------------------------------ CLI subcomandos ------------------------------

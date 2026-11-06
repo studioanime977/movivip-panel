@@ -34,15 +34,21 @@ PANEL_PORT_HAPROXY=54323    # panel HTTPS externo — frontend HAProxy
 HAPROXY_CFG="/etc/haproxy/haproxy.cfg"
 
 # Puertos reservados por ssl.sh / xray / v2ray / xhttp / bhttp / ssh-ws
+# El panel NUNCA usa estos para su web ni para inbounds (inbounds van en 11000+)
 RESERVED_PORTS=(
     80 443 8080 8443          # HAProxy frontends públicos
     54322 54323               # panel interno / panel HTTPS
     2001 2002 2004 8880       # XHTTP/BHTTP locales
     8765                      # ACME webroot
-    10002 10003 10004         # xray payload vmess/vless/trojan
-    10012 10013 10014         # xray gRPC
+    10002 10003 10004         # XRAY MANAGER vmess/vless/trojan (NO tocar)
+    10012 10013 10014         # XRAY MANAGER gRPC (NO tocar)
     10015                     # ssh-ws internal / www backend
+    10022 10023 10024         # V2Ray vmess/vless/trojan (NO tocar)
+    10032 10033 10034         # V2Ray gRPC (NO tocar)
 )
+
+# Puertos PROPIOS del panel para inbounds (separados de xray/v2ray)
+PANEL_INBOUND_PORTS=(11002 11003 11004 11012 11013 11014)
 
 is_reserved_port() {
     local p="$1" r
@@ -66,6 +72,21 @@ log() {
     local msg="[$(date '+%Y-%m-%d %H:%M:%S')] $*"
     echo -e "$msg" >>"$INSTALL_LOG" 2>/dev/null
     [[ $SILENT -eq 0 ]] && echo -e "$msg"
+    return 0
+}
+
+copy_install_source() {
+    local relative_path="$1" destination="$2"
+    if [[ -n "${MOVIVIP_SOURCE_DIR:-}" ]]; then
+        local source_path="${MOVIVIP_SOURCE_DIR%/}/${relative_path}"
+        if [[ ! -s "$source_path" ]]; then
+            log "${red}No existe el archivo local requerido: ${source_path}${plain}"
+            return 1
+        fi
+        cp "$source_path" "$destination"
+    else
+        wget --inet4-only -q -O "$destination" "${REPO_RAW}/${relative_path}"
+    fi
 }
 
 usage() {
@@ -84,7 +105,9 @@ Opciones:
 
 Puertos RESERVADOS (no usables por el panel):
   80 443 8080 8443 54323 | 2001 2002 2004 8880 | 8765
-  10002-10004 10012-10015  (xray/v2ray/ssh-ws backends)
+  10002-10004 10012-10015  (XRAY MANAGER)
+  10022-10024 10032-10034  (V2RAY)
+  El panel usa inbounds en 11002-11004 / 11012-11014 (paths /mx-*)
 
 Ejemplos:
   bash install.sh
@@ -194,19 +217,19 @@ install_base() {
     log "${yellow}Instalando dependencias base...${plain}"
     case "${release}" in
         ubuntu|debian|armbian)
-            apt-get update -qq && apt-get install -y -qq wget curl tar tzdata ca-certificates ;;
+            apt-get update -qq && apt-get install -y -qq wget curl tar tzdata ca-certificates python3 openssl ;;
         centos|rhel|almalinux|rocky|ol)
-            yum -y install -q wget curl tar tzdata ca-certificates ;;
+            yum -y install -q wget curl tar tzdata ca-certificates python3 openssl ;;
         fedora|amzn|virtuozzo)
-            dnf -y install -q wget curl tar tzdata ca-certificates ;;
+            dnf -y install -q wget curl tar tzdata ca-certificates python3 openssl ;;
         arch|manjaro|parch)
-            pacman -Sy --noconfirm --quiet wget curl tar tzdata ca-certificates ;;
+            pacman -Sy --noconfirm --quiet wget curl tar tzdata ca-certificates python openssl ;;
         opensuse-tumbleweed|opensuse-leap)
-            zypper -q refresh && zypper -q install -y wget curl tar timezone ca-certificates ;;
+            zypper -q refresh && zypper -q install -y wget curl tar timezone ca-certificates python3 openssl ;;
         alpine)
-            apk add --quiet wget curl tar tzdata ca-certificates ;;
+            apk add --quiet wget curl tar tzdata ca-certificates python3 openssl ;;
         *)
-            apt-get update -qq && apt-get install -y -qq wget curl tar tzdata ca-certificates ;;
+            apt-get update -qq && apt-get install -y -qq wget curl tar tzdata ca-certificates python3 openssl ;;
     esac
     if [[ $? -ne 0 ]]; then
         log "${red}Error instalando dependencias base.${plain}"
@@ -285,28 +308,32 @@ install_panel() {
 
     verify_sha256 "$tarball"
 
-    # CLI (menú)
+    # CLI del repositorio MOVIVIP-PANEL
     log "Descargando CLI movivip.sh..."
-    wget --inet4-only -q -O /usr/bin/movivip-temp "${REPO_RAW}/movivip.sh"
-    if [[ $? -ne 0 ]]; then
-        wget --inet4-only -q -O /usr/bin/movivip-temp \
-            "https://raw.githubusercontent.com/${UPSTREAM_REPO}/main/x-ui.sh"
-        if [[ $? -ne 0 ]]; then
-            log "${red}No se pudo descargar el CLI.${plain}"
-            exit 1
-        fi
+    if ! copy_install_source "movivip.sh" /usr/bin/movivip-temp; then
+        rm -f /usr/bin/movivip-temp
+        log "${red}No se pudo descargar el CLI MOVIVIP-PANEL.${plain}"
+        exit 1
     fi
 
-    # Detener servicio anterior si existe (x-ui o movivip)
+    # Detener versiones anteriores antes de reemplazar sus binarios.
+    log "Deteniendo servicios anteriores del panel..."
+    if [[ $release == "alpine" ]]; then
+        rc-service x-ui stop 2>/dev/null || true
+        rc-service "$SERVICE_NAME" stop 2>/dev/null || true
+        rc-update del x-ui 2>/dev/null || true
+        rm -f /etc/init.d/x-ui
+    else
+        systemctl stop x-ui 2>/dev/null || true
+        systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+        systemctl disable x-ui 2>/dev/null || true
+        rm -f /etc/systemd/system/x-ui.service
+        systemctl daemon-reload || {
+            log "${red}No se pudo recargar systemd tras migrar el servicio x-ui.${plain}"
+            return 1
+        }
+    fi
     if [[ -e "$PANEL_DIR" ]]; then
-        log "Deteniendo instalación anterior..."
-        if [[ $release == "alpine" ]]; then
-            rc-service x-ui stop 2>/dev/null
-            rc-service $SERVICE_NAME stop 2>/dev/null
-        else
-            systemctl stop x-ui 2>/dev/null
-            systemctl stop $SERVICE_NAME 2>/dev/null
-        fi
         rm -rf "$PANEL_DIR"
     fi
 
@@ -319,6 +346,37 @@ install_panel() {
         rm -rf /usr/local/x-ui
     fi
     rm -f "$tarball"
+
+    mkdir -p "$PANEL_DIR/lib" "$PANEL_DIR/presets"
+    local routes_helper="$PANEL_DIR/lib/haproxy_panel_routes.py.tmp"
+    if ! copy_install_source "lib/haproxy_panel_routes.py" "$routes_helper" \
+       || [[ ! -s "$routes_helper" ]]; then
+        rm -f "$routes_helper"
+        log "${red}No se pudo instalar el helper de rutas HAProxy del panel.${plain}"
+        exit 1
+    fi
+    mv -f "$routes_helper" "$PANEL_DIR/lib/haproxy_panel_routes.py"
+    chmod 644 "$PANEL_DIR/lib/haproxy_panel_routes.py"
+
+    local inbounds_helper="$PANEL_DIR/lib/haproxy_panel_inbounds.py.tmp"
+    if ! copy_install_source "lib/haproxy_panel_inbounds.py" "$inbounds_helper" \
+       || [[ ! -s "$inbounds_helper" ]]; then
+        rm -f "$inbounds_helper"
+        log "${red}No se pudo instalar el helper de sincronización de inbounds.${plain}"
+        exit 1
+    fi
+    mv -f "$inbounds_helper" "$PANEL_DIR/lib/haproxy_panel_inbounds.py"
+    chmod 644 "$PANEL_DIR/lib/haproxy_panel_inbounds.py"
+
+    local inbound_preset="$PANEL_DIR/presets/haproxy-inbounds.json.tmp"
+    if ! copy_install_source "presets/haproxy-inbounds.json" "$inbound_preset" \
+       || [[ ! -s "$inbound_preset" ]]; then
+        rm -f "$inbound_preset"
+        log "${red}No se pudo instalar el preset de los seis inbounds.${plain}"
+        exit 1
+    fi
+    mv -f "$inbound_preset" "$PANEL_DIR/presets/haproxy-inbounds.json"
+    chmod 644 "$PANEL_DIR/presets/haproxy-inbounds.json"
 
     cd "$PANEL_DIR" || exit 1
     chmod +x x-ui 2>/dev/null
@@ -422,51 +480,114 @@ config_after_install() {
 }
 
 # ------------------------------ HAProxy: frontend panel ----------------------
-# Replica el bloque xui_frontend/xui_backend de MOVIVIP PRODUCION/protocolos/xui.sh
-# bind *:54323 ssl → server 127.0.0.1:<panel_port>
+# The panel installer owns the panel HTTPS frontend.
 setup_haproxy_panel_frontend() {
     haproxy_mode || return 0
-    command -v haproxy >/dev/null 2>&1 || return 0
+    command -v haproxy >/dev/null 2>&1 || {
+        log "${red}HAProxy está configurado pero no se encontró el binario haproxy.${plain}"
+        return 1
+    }
+    command -v openssl >/dev/null 2>&1 || {
+        log "${red}Se requiere openssl para crear el certificado del panel.${plain}"
+        return 1
+    }
+    command -v python3 >/dev/null 2>&1 || {
+        log "${red}Se requiere python3 para actualizar la configuración HAProxy.${plain}"
+        return 1
+    }
 
-    local panel_port
+    local panel_port backup
     panel_port=$("$PANEL_DIR/x-ui" setting -show true 2>/dev/null | grep -Eo 'port: .+' | awk '{print $2}')
     [[ -z "$panel_port" ]] && panel_port="$PANEL_PORT_INTERNAL"
 
-    local cert_dir="/etc/haproxy/certs"
+    local cert_dir="${HAPROXY_CERT_DIR:-/etc/haproxy/certs}"
     local cert_file="$cert_dir/xui-selfsigned.pem"
     local CFG="$HAPROXY_CFG"
     local ip
     ip=$(detect_public_ip)
     [[ -z "$ip" ]] && ip=$(hostname -I | awk '{print $1}')
+    [[ -n "$ip" ]] || {
+        log "${red}No se pudo detectar la IP para el certificado del panel.${plain}"
+        return 1
+    }
 
     mkdir -p "$cert_dir"
 
     if [[ ! -f "$cert_file" ]]; then
         log "Generando certificado autofirmado para IP: ${ip}"
-        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-            -keyout "$cert_dir/key.pem" -out "$cert_dir/cert.pem" \
-            -subj "/CN=$ip" -addext "subjectAltName=IP:$ip" 2>/dev/null
-        cat "$cert_dir/cert.pem" "$cert_dir/key.pem" > "$cert_file"
-        chmod 600 "$cert_file"
+        local key_tmp="${cert_dir}/key.pem.tmp.$$"
+        local cert_tmp="${cert_dir}/cert.pem.tmp.$$"
+        local bundle_tmp="${cert_file}.tmp.$$"
+        if ! (umask 077; openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout "$key_tmp" -out "$cert_tmp" \
+            -subj "/CN=$ip" -addext "subjectAltName=IP:$ip") 2>/dev/null \
+            || ! cat "$cert_tmp" "$key_tmp" > "$bundle_tmp" \
+            || ! chmod 600 "$bundle_tmp" \
+            || ! mv -f "$key_tmp" "$cert_dir/key.pem" \
+            || ! mv -f "$cert_tmp" "$cert_dir/cert.pem" \
+            || ! mv -f "$bundle_tmp" "$cert_file"; then
+            rm -f "$key_tmp" "$cert_tmp" "$bundle_tmp"
+            log "${red}No se pudo crear el certificado autofirmado del panel.${plain}"
+            return 1
+        fi
     fi
 
-    # Limpiar bloque previo del panel (idempotente, igual que xui.sh)
-    python3 - "$CFG" <<'PYEOF'
+    backup=$(mktemp "${CFG}.panel-frontend-backup.XXXXXX") || {
+        log "${red}No se pudo respaldar la configuración HAProxy.${plain}"
+        return 1
+    }
+    if ! cp -p "$CFG" "$backup"; then
+        rm -f "$backup"
+        log "${red}No se pudo respaldar la configuración HAProxy.${plain}"
+        return 1
+    fi
+
+    # Eliminar el bloque administrado anterior y las variantes xui heredadas.
+    if ! python3 - "$CFG" <<'PYEOF'
+import os
 import sys, re
+import tempfile
+import stat
+
 p = sys.argv[1]
 with open(p, 'r', encoding='utf-8', errors='replace') as f:
     txt = f.read()
-txt = re.sub(r'^\s*# MOVIVIP Panel config[^\n]*\ninclude /etc/haproxy/haproxy-3xui\.cfg[^\n]*\n?', '', txt, flags=re.M)
-txt = re.sub(r'^\s*include /etc/haproxy/haproxy-3xui\.cfg[^\n]*\n?', '', txt, flags=re.M)
-txt = re.sub(r'\n?frontend xui_frontend\n(?:    [^\n]*\n)+', '\n', txt)
-txt = re.sub(r'\n?backend xui_backend\n(?:    [^\n]*\n)+', '\n', txt)
-with open(p, 'w', encoding='utf-8') as f:
-    f.write(txt)
+txt = re.sub(
+    r'(?ms)^# BEGIN MOVIVIP-PANEL FRONTEND\n.*?^# END MOVIVIP-PANEL FRONTEND\n?',
+    '', txt
+)
+txt = re.sub(r'(?m)^[ \t]*# (?:3x-ui|MOVIVIP Panel) config[^\n]*\n?', '', txt)
+txt = re.sub(r'(?m)^[ \t]*include /etc/haproxy/haproxy-3xui\.cfg[^\n]*\n?', '', txt)
+txt = re.sub(r'(?ms)^frontend xui_frontend[ \t]*\n.*?(?=^(?:global|defaults|frontend|backend|listen)\b|\Z)', '', txt)
+txt = re.sub(r'(?ms)^backend xui_backend[ \t]*\n.*?(?=^(?:global|defaults|frontend|backend|listen)\b|\Z)', '', txt)
+directory = os.path.dirname(os.path.abspath(p))
+mode = stat.S_IMODE(os.stat(p).st_mode)
+fd, temp = tempfile.mkstemp(prefix='.haproxy-panel-frontend-', dir=directory)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(txt.rstrip() + '\n')
+    os.chmod(temp, mode)
+    os.replace(temp, p)
+except Exception:
+    try:
+        os.unlink(temp)
+    except FileNotFoundError:
+        pass
+    raise
 PYEOF
+    then
+        if ! cp -p "$backup" "$CFG"; then
+            log "${red}No se pudo restaurar haproxy.cfg; respaldo disponible en ${backup}.${plain}"
+            return 1
+        fi
+        rm -f "$backup"
+        return 1
+    fi
 
     cat >> "$CFG" <<EOF
 
-# MOVIVIP Panel config — HTTPS externo (por IP, cert autofirmado)
+# BEGIN MOVIVIP-PANEL FRONTEND
+# Panel MOVIVIP — HTTPS externo por IP con certificado autofirmado
 frontend xui_frontend
     mode http
     bind *:${PANEL_PORT_HAPROXY} ssl crt $cert_file
@@ -477,20 +598,36 @@ frontend xui_frontend
 backend xui_backend
     mode http
     server xui_local 127.0.0.1:${panel_port} check inter 2000 rise 2 fall 3
+# END MOVIVIP-PANEL FRONTEND
 EOF
 
     rm -f /etc/haproxy/haproxy-3xui.cfg
 
-    if haproxy -c -f "$CFG" >/dev/null 2>&1; then
-        systemctl reload haproxy 2>/dev/null || true
-        log "${green}HAProxy frontend del panel configurado → https://${ip}:${PANEL_PORT_HAPROXY}${plain}"
-    else
-        log "${red}haproxy.cfg inválido tras añadir panel — revísalo manualmente.${plain}"
+    if ! haproxy -c -f "$CFG" >/dev/null 2>&1; then
+        if ! cp -p "$backup" "$CFG"; then
+            log "${red}haproxy.cfg es inválido; respaldo disponible en ${backup}.${plain}"
+            return 1
+        fi
+        rm -f "$backup"
+        log "${red}haproxy.cfg inválido tras añadir el panel; se restauró la configuración anterior.${plain}"
         haproxy -c -f "$CFG" 2>&1 | tail -5
+        return 1
     fi
+
+    if ! systemctl reload haproxy 2>/dev/null && ! systemctl restart haproxy 2>/dev/null; then
+        if ! cp -p "$backup" "$CFG"; then
+            log "${red}Falló la recarga; respaldo disponible en ${backup}.${plain}"
+            return 1
+        fi
+        rm -f "$backup"
+        log "${red}HAProxy no pudo recargar la configuración del panel; se restauró el archivo anterior.${plain}"
+        return 1
+    fi
+    rm -f "$backup"
+    log "${green}HAProxy frontend del panel configurado → https://${ip}:${PANEL_PORT_HAPROXY}${plain}"
 }
 
-# Restringe el puerto interno del panel: solo lo, DROP externo (como xui.sh)
+# Restringe el puerto interno del panel: solo lo, DROP externo.
 restrict_panel_port_local() {
     local port="${1:-$PANEL_PORT_INTERNAL}"
     command -v iptables >/dev/null 2>&1 || return 0
@@ -525,6 +662,9 @@ restrict_panel_port_local() {
 open_firewall_ports() {
     if [[ $NO_FIREWALL -eq 1 ]]; then
         log "${yellow}Firewall omitido (--no-firewall).${plain}"
+        if haproxy_mode; then
+            setup_haproxy_panel_frontend || return 1
+        fi
         return
     fi
 
@@ -556,7 +696,7 @@ open_firewall_ports() {
             firewall-cmd --reload >/dev/null 2>&1
         fi
 
-        setup_haproxy_panel_frontend
+        setup_haproxy_panel_frontend || return 1
 
         log "${green}✓ Firewall modo HAProxy: panel vía :${PANEL_PORT_HAPROXY} (HTTPS).${plain}"
         log "${yellow}Nota cloud:${plain} abre ${PANEL_PORT_HAPROXY}/tcp en Ingress Rules si usas Oracle/AWS/GCP/Azure."
@@ -601,7 +741,10 @@ install_service() {
         sed -i "s/x-ui/${SERVICE_NAME}/g" /etc/init.d/$SERVICE_NAME
         chmod +x /etc/init.d/$SERVICE_NAME
         rc-update add $SERVICE_NAME
-        rc-service $SERVICE_NAME start
+        rc-service $SERVICE_NAME start || {
+            log "${red}No se pudo iniciar el servicio ${SERVICE_NAME}.${plain}"
+            return 1
+        }
     else
         cat >"/etc/systemd/system/${SERVICE_NAME}.service" <<EOF
 [Unit]
@@ -618,13 +761,21 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable $SERVICE_NAME >/dev/null 2>&1
-        systemctl restart $SERVICE_NAME
+        systemctl daemon-reload || return 1
+        systemctl enable $SERVICE_NAME >/dev/null 2>&1 || {
+            log "${red}No se pudo habilitar el servicio ${SERVICE_NAME}.${plain}"
+            return 1
+        }
+        systemctl restart $SERVICE_NAME || {
+            log "${red}No se pudo iniciar el servicio ${SERVICE_NAME}.${plain}"
+            return 1
+        }
         sleep 2
-        systemctl is-active --quiet $SERVICE_NAME \
-            && log "${green}Servicio ${SERVICE_NAME} activo.${plain}" \
-            || log "${red}Servicio ${SERVICE_NAME} NO arrancó — revisa: journalctl -u ${SERVICE_NAME}${plain}"
+        if ! systemctl is-active --quiet $SERVICE_NAME; then
+            log "${red}Servicio ${SERVICE_NAME} NO arrancó — revisa: journalctl -u ${SERVICE_NAME}${plain}"
+            return 1
+        fi
+        log "${green}Servicio ${SERVICE_NAME} activo.${plain}"
     fi
 }
 
@@ -641,152 +792,155 @@ save_panel_credentials() {
 }
 
 # ------------------------------ Sync inbounds HAProxy ------------------------
-# Crea/actualiza inbounds en 3x-ui apuntando a los puertos internos de ssl.sh.
-# Usa la API REST del panel (session cookie).
+# Crea inbounds PROPIOS del panel en 11002+ (paths /mx-*) — NO toca puertos
+# del Xray manager (10002-10004) ni V2Ray (10022-10024).
 PRESETS_URL="${REPO_RAW}/presets/haproxy-inbounds.json"
 
-sync_haproxy_inbounds() {
-    haproxy_mode || { log "Sin HAProxy — skip sync inbounds."; return 0; }
-    command -v python3 >/dev/null 2>&1 || { log "${yellow}python3 no disponible — sync inbounds omitido.${plain}"; return 0; }
+# Puertos prohibidos para inbounds del panel (otros servicios)
+PANEL_FORBIDDEN_PORTS=(80 443 8080 8443 54322 54323 \
+    10002 10003 10004 10012 10013 10014 10015 \
+    10022 10023 10024 10032 10033 10034)
 
-    local cred="/etc/movivip/xui-credentials"
-    [[ -f "$cred" ]] || { log "${yellow}Sin credenciales — skip sync inbounds.${plain}"; return 0; }
+inject_haproxy_panel_routes() {
+    command -v python3 >/dev/null 2>&1 || { log "${yellow}python3 requerido para rutas HAProxy.${plain}"; return 1; }
+    local cfg="$HAPROXY_CFG"
+    local helper="$PANEL_DIR/lib/haproxy_panel_routes.py"
+    local backup result
+    [[ -f "$cfg" ]] || { log "${red}No existe $cfg${plain}"; return 1; }
+    [[ -s "$helper" ]] || { log "${red}No existe el helper de rutas: $helper${plain}"; return 1; }
 
-    local panel_port
-    panel_port=$("$PANEL_DIR/x-ui" setting -show true 2>/dev/null | grep -Eo 'port: .+' | awk '{print $2}')
-    [[ -z "$panel_port" ]] && panel_port="$PANEL_PORT_INTERNAL"
-
-    local presets="/tmp/movivip-haproxy-inbounds.json"
-    log "Descargando presets de inbounds HAProxy..."
-    wget --inet4-only -q -O "$presets" "$PRESETS_URL"
-    if [[ ! -s "$presets" ]]; then
-        # fallback: embebido mínimo si falla la descarga
-        log "${yellow}No se pudo descargar presets — usando lista embebida.${plain}"
+    backup=$(mktemp "${cfg}.panel-backup.XXXXXX") || { log "${red}No se pudo crear respaldo de HAProxy.${plain}"; return 1; }
+    if ! cp -p "$cfg" "$backup"; then
+        rm -f "$backup"
+        log "${red}No se pudo respaldar $cfg.${plain}"
+        return 1
+    fi
+    if ! result=$(python3 "$helper" "$cfg"); then
+        if ! cp -p "$backup" "$cfg"; then
+            log "${red}Falló la inyección; respaldo disponible en ${backup}.${plain}"
+            return 1
+        fi
+        rm -f "$backup"
+        log "${red}No se pudieron inyectar las rutas del panel.${plain}"
+        return 1
+    fi
+    if ! haproxy -c -f "$cfg" >/dev/null 2>&1; then
+        if ! cp -p "$backup" "$cfg"; then
+            log "${red}haproxy -c falló; respaldo disponible en ${backup}.${plain}"
+            return 1
+        fi
+        rm -f "$backup"
+        log "${red}haproxy -c falló; se restauró la configuración anterior.${plain}"
+        haproxy -c -f "$cfg" 2>&1 | tail -5
         return 1
     fi
 
-    log "Sincronizando inbounds con backends HAProxy (10002-10004, 10012-10014)..."
-    python3 - "$panel_port" "$cred" "$presets" <<'PYEOF'
-import json, sys, urllib.request, http.cookiejar, re
+    if [[ "$result" == *MOVIVIP_PANEL_ROUTES_UPDATED* ]]; then
+        if ! systemctl reload haproxy 2>/dev/null && ! systemctl restart haproxy 2>/dev/null; then
+            if ! cp -p "$backup" "$cfg"; then
+                log "${red}Falló la recarga; respaldo disponible en ${backup}.${plain}"
+                return 1
+            fi
+            rm -f "$backup"
+            log "${red}No se pudo recargar ni reiniciar HAProxy.${plain}"
+            return 1
+        fi
+        log "${green}Rutas del panel instaladas y HAProxy recargado.${plain}"
+    else
+        log "${green}Rutas del panel ya listas; HAProxy no necesitó cambios.${plain}"
+    fi
+    rm -f "$backup"
+}
 
-panel_port, cred_path, presets_path = sys.argv[1], sys.argv[2], sys.argv[3]
+sync_haproxy_inbounds() {
+    command -v python3 >/dev/null 2>&1 || { log "${red}python3 es obligatorio para crear los seis inbounds del panel.${plain}"; return 1; }
 
-creds = {}
-with open(cred_path) as f:
-    for line in f:
-        if '=' in line:
-            k, v = line.strip().split('=', 1)
-            creds[k] = v
+    local cred="/etc/movivip/xui-credentials"
+    [[ -f "$cred" ]] || { log "${red}No hay credenciales para sincronizar los seis inbounds del panel.${plain}"; return 1; }
 
-username = creds.get('username', 'admin')
-password = creds.get('password', '')
+    local panel_settings panel_port panel_base_path
+    panel_settings=$("$PANEL_DIR/x-ui" setting -show true 2>/dev/null)
+    panel_port=$(echo "$panel_settings" | grep -Eo 'port: .+' | awk '{print $2}')
+    [[ -z "$panel_port" ]] && panel_port="$PANEL_PORT_INTERNAL"
+    panel_base_path=$(echo "$panel_settings" | grep -Eo 'webBasePath: .+' | awk '{print $2}')
 
-base = f'http://127.0.0.1:{panel_port}'
-cj = http.cookiejar.CookieJar()
-opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+    local presets="/tmp/movivip-haproxy-inbounds.json"
+    log "Descargando presets (paths /mx-*, puertos 11002+)..."
+    if [[ -s "$PANEL_DIR/presets/haproxy-inbounds.json" ]]; then
+        cp "$PANEL_DIR/presets/haproxy-inbounds.json" "$presets"
+    elif [[ -n "${MOVIVIP_SOURCE_DIR:-}" ]]; then
+        copy_install_source "presets/haproxy-inbounds.json" "$presets" || return 1
+    else
+        wget --inet4-only -q -O "$presets" "$PRESETS_URL"
+    fi
+    if [[ ! -s "$presets" ]]; then
+        log "${red}No se pudieron descargar los presets de los seis inbounds.${plain}"
+        return 1
+    fi
 
-def req(method, path, data=None):
-    url = base + path
-    body = None
-    headers = {}
-    if data is not None:
-        body = json.dumps(data).encode()
-        headers['Content-Type'] = 'application/json'
-    r = urllib.request.Request(url, data=body, headers=headers, method=method)
-    with opener.open(r, timeout=15) as resp:
-        return json.loads(resp.read().decode() or '{}')
+    # Lista de prohibidos como args
+    local forbidden_csv
+    forbidden_csv=$(IFS=,; echo "${PANEL_FORBIDDEN_PORTS[*]}")
 
-# login
-try:
-    login = req('POST', '/login', {'username': username, 'password': password})
-except Exception as e:
-    print(f'LOGIN_FAIL {e}')
-    sys.exit(1)
-
-if login.get('success') is False:
-    print(f'LOGIN_FAIL {login}')
-    sys.exit(1)
-
-# listar inbounds existentes
-try:
-    lst = req('GET', '/panel/api/inbounds/list')
-except Exception as e:
-    print(f'LIST_FAIL {e}')
-    sys.exit(1)
-
-existing = {}
-for ib in (lst.get('obj') or []):
-    tag = ib.get('tag') or ''
-    port = ib.get('port')
-    existing[tag] = ib
-    # también indexar por puerto para detectar conflictos
-    existing[f'port:{port}'] = ib
-
-with open(presets_path) as f:
-    presets = json.load(f)
-
-forib = presets.get('inbounds', []):
-    tag = ib.get('tag')
-    port = ib.get('port')
-    # skip si ya existe el tag
-    if tag in existing:
-        print(f'OK exists {tag} :{port}')
-        continue
-    # si hay otro inbound en el mismo puerto, avisar
-    if f'port:{port}' in existing:
-        other = existing[f'port:{port}']
-        print(f'WARN port {port} already used by {other.get("tag")} — skip {tag}')
-        continue
-    payload = {
-        'up': 0,
-        'down': 0,
-        'remark': ib.get('tag', tag),
-        'enable': True,
-        'expiryTime': 0,
-        'listen': ib.get('listen', '127.0.0.1'),
-        'port': str(port),
-        'protocol': ib.get('protocol'),
-        'settings': ib.get('settings', {}),
-        'streamSettings': ib.get('streamSettings', {}),
-        'sniffing': ib.get('sniffing', {'enabled': True, 'destOverride': ['http', 'tls']}),
-        'tag': tag,
+    log "Creando/verificando los seis inbounds del panel → 11002-11004 / 11012-11014..."
+    local inbounds_helper="$PANEL_DIR/lib/haproxy_panel_inbounds.py"
+    [[ -s "$inbounds_helper" ]] || {
+        log "${red}No existe el helper de sincronización: $inbounds_helper${plain}"
+        rm -f "$presets"
+        return 1
     }
-    try:
-        res = req('POST', '/panel/api/inbounds/add', payload)
-        if res.get('success'):
-            print(f'OK created {tag} :{port} listen={ib.get("listen")}')
-        else:
-            print(f'FAIL create {tag}: {res}')
-    except Exception as e:
-        print(f'FAIL create {tag}: {e}')
-
-print('SYNC_DONE')
-PYEOF
+    python3 "$inbounds_helper" "$panel_port" "$cred" "$presets" "$forbidden_csv" "$panel_base_path"
 
     local rc=$?
-    if [[ $rc -eq 0 ]]; then
-        log "${green}Inbounds HAProxy sincronizados.${plain}"
-        # reiniciar panel para que xray recargue inbounds
-        if [[ $release == "alpine" ]]; then
-            rc-service $SERVICE_NAME restart >/dev/null 2>&1
-        else
-            systemctl restart $SERVICE_NAME >/dev/null 2>&1
-        fi
-        sleep 2
+    if [[ $rc -ne 0 ]]; then
+        rm -f "$presets"
+        log "${red}Sync de inbounds falló (rc=$rc).${plain}"
+        return 1
+    fi
+
+    log "${green}Seis inbounds del panel creados/verificados y visibles en 3X-UI.${plain}"
+
+    if haproxy_mode; then
+        inject_haproxy_panel_routes || { rm -f "$presets"; return 1; }
     else
-        log "${red}Sync de inbounds falló (rc=$rc). Revisa credenciales/puerto del panel.${plain}"
+        log "${yellow}HAProxy no está instalado: los seis inbounds quedan creados, pero sin rutas públicas.${plain}"
     fi
     rm -f "$presets"
+
+    if [[ $release == "alpine" ]]; then
+        rc-service $SERVICE_NAME restart >/dev/null 2>&1
+    else
+        systemctl restart $SERVICE_NAME >/dev/null 2>&1
+    fi
+    sleep 2
 }
 
 # ------------------------------ Main -----------------------------------------
 main() {
-    install_base
-    install_panel
-    config_after_install
-    install_service
-    open_firewall_ports
-    sync_haproxy_inbounds
+    install_base || {
+        log "${red}Falló la instalación de dependencias; panel no instalado.${plain}"
+        return 1
+    }
+    install_panel || {
+        log "${red}Falló la descarga o instalación del panel.${plain}"
+        return 1
+    }
+    config_after_install || {
+        log "${red}Falló la configuración inicial del panel.${plain}"
+        return 1
+    }
+    install_service || {
+        log "${red}Falló la instalación o el inicio del servicio.${plain}"
+        return 1
+    }
+    open_firewall_ports || {
+        log "${red}Falló la configuración de acceso/firewall del panel.${plain}"
+        return 1
+    }
+    sync_haproxy_inbounds || {
+        log "${red}Falló la sincronización de rutas/inbounds HAProxy.${plain}"
+        return 1
+    }
 
     log "${green}${PANEL_NAME} PANEL instalado correctamente.${plain}"
     if haproxy_mode; then
@@ -795,16 +949,19 @@ main() {
 ${cyan}Modo HAProxy activo:${plain}
   • Panel interno:  127.0.0.1:${PANEL_PORT_INTERNAL}
   • Panel externo:  https://<IP>:${PANEL_PORT_HAPROXY}
-  • Inbounds:       127.0.0.1:10002-10004 (ws) / 10012-10014 (grpc)
-  • Públicos:       80/443/8080/8443 → HAProxy (ssl.sh) — NO usar en inbounds
+  • Inbounds panel: 127.0.0.1:11002-11004 (ws) / 11012-11014 (grpc)
+  • WS HTTP:        :80 / :8080
+  • WS TLS:         :443 / :8443
+  • gRPC TLS/H2:    :443 / :8443
+  • Inbounds:       los crea este instalador en loopback y los asocia HAProxy
 
   Rutas HAProxy → backend:
-    /vmess       → 127.0.0.1:10002
-    /vless       → 127.0.0.1:10003
-    /trojan-ws   → 127.0.0.1:10004
-    /vmess-grpc  → 127.0.0.1:10012
-    /vless-grpc  → 127.0.0.1:10013
-    /trojan-grpc → 127.0.0.1:10014
+    /mx-vmess       → 127.0.0.1:11002
+    /mx-vless       → 127.0.0.1:11003
+    /mx-trojan-ws   → 127.0.0.1:11004
+    /mx-vmess-grpc  → 127.0.0.1:11012
+    /mx-vless-grpc  → 127.0.0.1:11013
+    /mx-trojan-grpc → 127.0.0.1:11014
 EOF
     fi
     cat <<EOF
@@ -828,4 +985,5 @@ Log de instalación: ${INSTALL_LOG}
 EOF
 }
 
-main
+main "$@"
+exit $?
